@@ -36,6 +36,8 @@ export const harnessAccountProfileSchema = z
     fiveHour: harnessAccountProfileWindowSchema.optional(),
     sevenDay: harnessAccountProfileWindowSchema.optional(),
     usageObservedAt: isoDateSchema.optional(),
+    /** When the saved sign-in stops working; absent when the Harness does not report it. */
+    expiresAt: isoDateSchema.optional(),
     error: z.string().max(512).optional(),
   })
   .strict();
@@ -105,6 +107,14 @@ export const harnessAccountProfilesParamsSchema = z.discriminatedUnion("action",
     })
     .strict(),
   z.object({ ...target, action: z.literal("login.cancel"), loginId: loginIdSchema }).strict(),
+  /** Saves a long-lived token created elsewhere, such as by `claude setup-token`. */
+  z
+    .object({
+      ...target,
+      action: z.literal("token.add"),
+      token: z.string().trim().min(20).max(4_096),
+    })
+    .strict(),
   z
     .object({ ...target, action: z.literal("activate"), profileId: profileIdSchema.nullable() })
     .strict(),

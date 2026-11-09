@@ -1,9 +1,12 @@
 import { createHash, randomBytes } from "node:crypto";
 
 /**
- * Claude.ai subscription OAuth, as Claude Code itself performs it (verified against Claude Code
- * 2.1.317). Profiles signed in here are owned by codexhost alone: their refresh tokens are never
- * shared with Claude Code's own login, so rotation cannot invalidate either side.
+ * Claude.ai subscription OAuth, as Claude Code performs it for `claude setup-token` (verified
+ * against Claude Code 2.1.317): the token exchange asks for a one-year access token, so a saved
+ * sign-in needs no refresh. The token endpoint only honours a custom `expires_in` for some scopes
+ * (`user:mcp_servers`, for one, is rejected), hence the reduced scope set. `user:profile` keeps the
+ * profile and usage endpoints available; Claude Code itself treats a token passed through
+ * `CLAUDE_CODE_OAUTH_TOKEN` as inference-only either way.
  */
 export const CLAUDE_OAUTH = Object.freeze({
   clientId: "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
@@ -11,25 +14,26 @@ export const CLAUDE_OAUTH = Object.freeze({
   tokenUrl: "https://platform.claude.com/v1/oauth/token",
   manualRedirectUrl: "https://platform.claude.com/oauth/code/callback",
   apiBaseUrl: "https://api.anthropic.com",
-  scopes: [
-    "org:create_api_key",
-    "user:profile",
-    "user:inference",
-    "user:sessions:claude_code",
-    "user:mcp_servers",
-    "user:file_upload",
-    "user:plugins",
-  ],
+  scopes: ["user:inference", "user:profile"],
+  /** One year, the lifetime `claude setup-token` requests. */
+  tokenLifetimeSeconds: 31_536_000,
 });
 
 const REQUEST_TIMEOUT_MS = 20_000;
 
 export interface ClaudeOAuthTokens {
   accessToken: string;
-  refreshToken: string;
-  /** Unix milliseconds. */
-  expiresAt: number;
+  /** Absent for long-lived tokens, which are used until they expire. */
+  refreshToken?: string;
+  /** Unix milliseconds; absent when unknown, as for a pasted token. */
+  expiresAt?: number;
   scopes: string[];
+}
+
+export interface ClaudeOAuthExchange {
+  tokens: ClaudeOAuthTokens;
+  /** Account identity the token endpoint returns alongside the tokens. */
+  identity: ClaudeOAuthProfile;
 }
 
 export interface ClaudeOAuthProfile {
@@ -144,17 +148,45 @@ function parseTokens(value: unknown, previousRefreshToken?: string): ClaudeOAuth
   const accessToken = text(value.access_token);
   const refreshToken = text(value.refresh_token) ?? previousRefreshToken;
   const expiresIn = value.expires_in;
-  if (!accessToken || !refreshToken || typeof expiresIn !== "number" || expiresIn <= 0) {
+  if (!accessToken || typeof expiresIn !== "number" || expiresIn <= 0) {
     throw new ClaudeOAuthError("Token response is malformed");
   }
   const scopes = (text(value.scope) ?? "").split(" ").filter(Boolean);
-  return { accessToken, refreshToken, expiresAt: Date.now() + expiresIn * 1000, scopes };
+  return {
+    accessToken,
+    ...(refreshToken ? { refreshToken } : {}),
+    expiresAt: Date.now() + expiresIn * 1000,
+    scopes,
+  };
+}
+
+function identityFrom(value: unknown): ClaudeOAuthProfile {
+  const account = isRecord(value) && isRecord(value.account) ? value.account : {};
+  const organization = isRecord(value) && isRecord(value.organization) ? value.organization : {};
+  const identity: ClaudeOAuthProfile = {};
+  const fields: Array<[keyof ClaudeOAuthProfile, string | undefined]> = [
+    ["accountUuid", text(account.uuid)],
+    ["email", text(account.email_address) ?? text(account.email)],
+    ["organizationUuid", text(organization.uuid)],
+    ["organizationName", text(organization.name)],
+  ];
+  for (const [key, field] of fields) if (field) identity[key] = field;
+  return identity;
+}
+
+/** A token pasted by the user, such as the output of `claude setup-token`. */
+export function parseClaudeAccessToken(value: string): string {
+  const token = value.trim();
+  if (!/^sk-ant-oat\d*-[A-Za-z0-9_-]{20,}$/u.test(token)) {
+    throw new Error("This is not a Claude subscription token (it starts with sk-ant-oat)");
+  }
+  return token;
 }
 
 export async function exchangeClaudeCode(
   fetchImpl: FetchLike,
   input: { code: string; pkce: ClaudePkce; port: number | null },
-): Promise<ClaudeOAuthTokens> {
+): Promise<ClaudeOAuthExchange> {
   const value = await request(
     fetchImpl,
     CLAUDE_OAUTH.tokenUrl,
@@ -168,17 +200,19 @@ export async function exchangeClaudeCode(
         client_id: CLAUDE_OAUTH.clientId,
         code_verifier: input.pkce.verifier,
         state: input.pkce.state,
+        expires_in: CLAUDE_OAUTH.tokenLifetimeSeconds,
       }),
     },
     "Sign-in",
   );
-  return parseTokens(value);
+  return { tokens: parseTokens(value), identity: identityFrom(value) };
 }
 
 export async function refreshClaudeTokens(
   fetchImpl: FetchLike,
   tokens: ClaudeOAuthTokens,
 ): Promise<ClaudeOAuthTokens> {
+  if (!tokens.refreshToken) throw new ClaudeOAuthError("This sign-in cannot be refreshed");
   const scopes = tokens.scopes.filter((scope) => scope !== "org:create_api_key");
   const value = await request(
     fetchImpl,

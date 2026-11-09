@@ -168,13 +168,16 @@ export class ClaudeLoginFlow {
     if (login.finishing) return login.finishing;
     login.finishing = (async () => {
       try {
-        const tokens = await exchangeClaudeCode(this.fetchImpl, {
+        const { tokens, identity } = await exchangeClaudeCode(this.fetchImpl, {
           code,
           pkce: login.pkce,
           port: login.port,
         });
-        const profile = await fetchClaudeProfile(this.fetchImpl, tokens.accessToken);
-        login.profileId = await this.save({ tokens, profile });
+        // The profile adds the plan; the identity from the token response is enough without it.
+        const profile = await fetchClaudeProfile(this.fetchImpl, tokens.accessToken).catch(
+          () => ({}),
+        );
+        login.profileId = await this.save({ tokens, profile: { ...identity, ...profile } });
         login.status = "completed";
       } catch (error) {
         login.status = "failed";

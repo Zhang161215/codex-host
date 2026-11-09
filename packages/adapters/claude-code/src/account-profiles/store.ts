@@ -1,4 +1,3 @@
-import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { chmod, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
@@ -7,9 +6,10 @@ import path from "node:path";
 import type { ClaudeOAuthTokens, ClaudeUsageWindow } from "./oauth.js";
 
 /**
- * Saved Claude sign-ins. Metadata lives in `<codexhost data>/claude-accounts/profiles.json`;
- * tokens live in the macOS Keychain on macOS and in owner-only files elsewhere, matching how
- * Claude Code itself stores its own login on each platform.
+ * Saved Claude sign-ins, the same on every platform: metadata in
+ * `<codexhost data>/claude-accounts/profiles.json`, each token in `secrets/<profileId>.json`.
+ * Files are owner-only on macOS and Linux; on Windows they inherit the user profile's ACL, the
+ * same protection Claude Code gives its own `.credentials.json` there.
  */
 export interface StoredClaudeProfile {
   profileId: string;
@@ -58,12 +58,26 @@ export function claudeAccountsDirectory(environment: NodeJS.ProcessEnv): string 
   return path.join(root, "claude-accounts");
 }
 
+/** Windows refuses to replace a file another handle has open; such locks are brief. */
+async function replaceFile(from: string, to: string): Promise<void> {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await rename(from, to);
+      return;
+    } catch (error) {
+      const code = isRecord(error) ? error.code : undefined;
+      if (attempt >= 4 || !["EPERM", "EBUSY", "EACCES"].includes(String(code))) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 50 * (attempt + 1)));
+    }
+  }
+}
+
 async function writePrivateFile(file: string, content: string): Promise<void> {
   await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
   const temporary = `${file}.${randomUUID()}.tmp`;
   try {
     await writeFile(temporary, content, { mode: 0o600, flag: "wx" });
-    await rename(temporary, file);
+    await replaceFile(temporary, file);
     await chmod(file, 0o600).catch(() => undefined);
   } finally {
     await rm(temporary, { force: true });
@@ -116,16 +130,13 @@ export interface ClaudeTokenStore {
 function parseTokens(text: string): ClaudeOAuthTokens | null {
   try {
     const value: unknown = JSON.parse(text);
-    if (
-      isRecord(value) &&
-      typeof value.accessToken === "string" &&
-      typeof value.refreshToken === "string" &&
-      typeof value.expiresAt === "number"
-    ) {
+    if (isRecord(value) && typeof value.accessToken === "string" && value.accessToken) {
       return {
         accessToken: value.accessToken,
-        refreshToken: value.refreshToken,
-        expiresAt: value.expiresAt,
+        ...(typeof value.refreshToken === "string" && value.refreshToken
+          ? { refreshToken: value.refreshToken }
+          : {}),
+        ...(typeof value.expiresAt === "number" ? { expiresAt: value.expiresAt } : {}),
         scopes: Array.isArray(value.scopes)
           ? value.scopes.filter((scope): scope is string => typeof scope === "string")
           : [],
@@ -161,80 +172,6 @@ class FileTokenStore implements ClaudeTokenStore {
   }
 }
 
-const KEYCHAIN_SERVICE = "codexhost Claude account";
-/** `security -i` reads one command line from stdin; longer payloads fall back to argv. */
-const SECURITY_STDIN_LIMIT = 4_000;
-
-function runSecurity(
-  args: readonly string[],
-  input?: string,
-): Promise<{ code: number; stdout: string }> {
-  return new Promise((resolve) => {
-    if (input === undefined) {
-      execFile("/usr/bin/security", args, { timeout: 10_000 }, (error, stdout) => {
-        const code = error ? (typeof error.code === "number" ? error.code : 1) : 0;
-        resolve({ code, stdout: String(stdout) });
-      });
-      return;
-    }
-    const child = spawn("/usr/bin/security", args, { stdio: ["pipe", "ignore", "ignore"] });
-    const timer = setTimeout(() => child.kill("SIGKILL"), 10_000);
-    child.on("error", () => {
-      clearTimeout(timer);
-      resolve({ code: 1, stdout: "" });
-    });
-    child.on("exit", (code) => {
-      clearTimeout(timer);
-      resolve({ code: code ?? 1, stdout: "" });
-    });
-    child.stdin.end(input);
-  });
-}
-
-class KeychainTokenStore implements ClaudeTokenStore {
-  async read(profileId: string): Promise<ClaudeOAuthTokens | null> {
-    const { code, stdout } = await runSecurity([
-      "find-generic-password",
-      "-a",
-      profileId,
-      "-s",
-      KEYCHAIN_SERVICE,
-      "-w",
-    ]);
-    return code === 0 ? parseTokens(stdout.trim()) : null;
-  }
-
-  async write(profileId: string, tokens: ClaudeOAuthTokens): Promise<void> {
-    const hex = Buffer.from(JSON.stringify(tokens), "utf8").toString("hex");
-    const command = `add-generic-password -U -a "${profileId}" -s "${KEYCHAIN_SERVICE}" -X "${hex}"\n`;
-    const result =
-      command.length <= SECURITY_STDIN_LIMIT
-        ? await runSecurity(["-i"], command)
-        : await runSecurity([
-            "add-generic-password",
-            "-U",
-            "-a",
-            profileId,
-            "-s",
-            KEYCHAIN_SERVICE,
-            "-X",
-            hex,
-          ]);
-    // `security -i` can exit 0 after a failed command; the read-back is the real confirmation.
-    const saved = result.code === 0 ? await this.read(profileId) : null;
-    if (saved?.accessToken !== tokens.accessToken || saved.refreshToken !== tokens.refreshToken) {
-      throw new Error("Could not save the Claude sign-in to the Keychain");
-    }
-  }
-
-  async delete(profileId: string): Promise<void> {
-    await runSecurity(["delete-generic-password", "-a", profileId, "-s", KEYCHAIN_SERVICE]);
-  }
-}
-
-export function createClaudeTokenStore(
-  directory: string,
-  platform: NodeJS.Platform = process.platform,
-): ClaudeTokenStore {
-  return platform === "darwin" ? new KeychainTokenStore() : new FileTokenStore(directory);
+export function createClaudeTokenStore(directory: string): ClaudeTokenStore {
+  return new FileTokenStore(directory);
 }

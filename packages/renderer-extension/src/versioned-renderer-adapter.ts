@@ -1054,6 +1054,13 @@ export function installCurrentRendererAdapter(): {
       if (!client.credentialImports) throw new Error("Credential imports are unavailable");
       return client.credentialImports(request, targetHarnessId);
     },
+    harnessAccountProfiles: (
+      params: Parameters<NonNullable<RendererModelClient["harnessAccountProfiles"]>>[0],
+    ) => {
+      const client = settingsModelClient();
+      if (!client.harnessAccountProfiles) throw new Error("Saved Harness sign-ins are unavailable");
+      return client.harnessAccountProfiles(params);
+    },
     listCodexAccounts: () => settingsModelClient().listCodexAccounts(),
     refreshCodexAccounts: () => {
       const client = settingsModelClient();

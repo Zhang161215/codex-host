@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { ClaudeAccountProfiles } from "../src/account-profiles/manager.js";
 import { parsePastedAuthorization } from "../src/account-profiles/login.js";
 import { CLAUDE_OAUTH, type ClaudeOAuthTokens } from "../src/account-profiles/oauth.js";
-import type { ClaudeTokenStore } from "../src/account-profiles/store.js";
+import { createClaudeTokenStore, type ClaudeTokenStore } from "../src/account-profiles/store.js";
 
 function defined<T>(value: T | null | undefined): T {
   if (value === null || value === undefined) throw new Error("Expected a value");
@@ -40,22 +40,41 @@ interface FakeAccount {
   sevenDay: number;
 }
 
-/** Anthropic endpoints keyed by access token; refresh rotates both tokens. */
+/**
+ * Anthropic endpoints keyed by access token. A sign-in asking for a custom lifetime gets a
+ * long-lived token without a refresh token, as `claude setup-token` does; refreshable pairs come
+ * from `issueRefreshable`. Inference-only tokens cannot read the profile or usage.
+ */
 function fakeAnthropic(accounts: Record<string, FakeAccount>) {
   const byAccess = new Map<string, FakeAccount>();
   const byRefresh = new Map<string, FakeAccount>();
+  const inferenceOnly = new Set<string>();
+  const exchanges: Array<Record<string, unknown>> = [];
   let issued = 0;
-  const issue = (account: FakeAccount) => {
+  const issue = (account: FakeAccount, lifetime?: number) => {
     issued += 1;
     const access = `access-${account.uuid}-${issued}`;
-    const refresh = `refresh-${account.uuid}-${issued}`;
     byAccess.set(access, account);
+    const identity = {
+      account: { uuid: account.uuid, email_address: account.email },
+      organization: { uuid: `org-${account.uuid}`, name: "Personal" },
+    };
+    if (lifetime !== undefined) {
+      return {
+        access_token: access,
+        expires_in: lifetime,
+        scope: "user:inference user:profile",
+        ...identity,
+      };
+    }
+    const refresh = `refresh-${account.uuid}-${issued}`;
     byRefresh.set(refresh, account);
     return {
       access_token: access,
       refresh_token: refresh,
       expires_in: 28_800,
       scope: "user:inference user:profile",
+      ...identity,
     };
   };
   const revoked = new Set<string>();
@@ -63,19 +82,25 @@ function fakeAnthropic(accounts: Record<string, FakeAccount>) {
     new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
   const fetch = vi.fn(async (url: string, init?: RequestInit) => {
     if (url === CLAUDE_OAUTH.tokenUrl) {
-      const body = JSON.parse(String(init?.body)) as Record<string, string>;
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
       if (body.grant_type === "authorization_code") {
-        const account = accounts[defined(body.code)];
-        return account ? json(issue(account)) : json({ error: "invalid_grant" }, 400);
+        exchanges.push(body);
+        const account = accounts[String(body.code)];
+        if (!account) return json({ error: "invalid_grant" }, 400);
+        return json(
+          issue(account, typeof body.expires_in === "number" ? body.expires_in : undefined),
+        );
       }
-      const account = byRefresh.get(defined(body.refresh_token));
+      const refreshToken = String(body.refresh_token);
+      const account = byRefresh.get(refreshToken);
       if (!account || revoked.has(account.uuid)) return json({ error: "invalid_grant" }, 400);
-      byRefresh.delete(defined(body.refresh_token));
+      byRefresh.delete(refreshToken);
       return json(issue(account));
     }
     const token = String((init?.headers as Record<string, string>).Authorization).slice(7);
     const account = byAccess.get(token);
-    if (!account) return json({ error: "unauthorized" }, 401);
+    if (!account || revoked.has(account.uuid)) return json({ error: "unauthorized" }, 401);
+    if (inferenceOnly.has(token)) return json({ error: "insufficient_scope" }, 403);
     if (url.endsWith("/api/oauth/profile")) {
       return json({
         account: { uuid: account.uuid, email: account.email, has_claude_max: true },
@@ -87,7 +112,27 @@ function fakeAnthropic(accounts: Record<string, FakeAccount>) {
       seven_day: { utilization: account.sevenDay, resets_at: "2026-11-12T12:00:00Z" },
     });
   });
-  return { fetch, revoke: (uuid: string) => revoked.add(uuid) };
+  return {
+    fetch,
+    exchanges,
+    revoke: (uuid: string) => revoked.add(uuid),
+    /** A token as `claude setup-token` prints it: inference only, lifetime unknown to us. */
+    setupToken(account: FakeAccount): string {
+      const token = `sk-ant-oat01-${account.uuid}-${"x".repeat(24)}`;
+      byAccess.set(token, account);
+      inferenceOnly.add(token);
+      return token;
+    },
+    issueRefreshable(account: FakeAccount, expiresAt: number): ClaudeOAuthTokens {
+      const value: { access_token: string; refresh_token?: string } = issue(account);
+      return {
+        accessToken: value.access_token,
+        refreshToken: defined(value.refresh_token),
+        expiresAt,
+        scopes: ["user:inference", "user:profile"],
+      };
+    },
+  };
 }
 
 async function setup(accounts: Record<string, FakeAccount>, now = () => Date.now()) {
@@ -130,8 +175,14 @@ const carol: FakeAccount = {
 
 describe("Claude account profiles", () => {
   it("saves a sign-in, makes the first one active and injects its token", async () => {
-    const { profiles, signIn } = await setup({ "code-a": alice, "code-b": bob });
+    const { profiles, anthropic, signIn } = await setup({ "code-a": alice, "code-b": bob });
     const first = await signIn("code-a");
+    // A one-year token, as `claude setup-token` requests, with the scopes that allow it.
+    expect(anthropic.exchanges[0]).toMatchObject({ expires_in: 31_536_000 });
+    const scope = new URL(defined(first.login).authorizeUrl).searchParams.get("scope");
+    expect(scope).toBe("user:inference user:profile");
+    const yearAhead = Date.now() + 364 * 86_400_000;
+    expect(Date.parse(defined(first.profiles[0]?.expiresAt))).toBeGreaterThan(yearAhead);
     expect(first.login?.status).toBe("completed");
     expect(first.activeProfileId).toBe(first.profiles[0]?.profileId);
     expect(first.profiles[0]).toMatchObject({
@@ -179,34 +230,57 @@ describe("Claude account profiles", () => {
     expect(await profiles.spawnEnvironment()).toBeNull();
   });
 
-  it("refreshes a token close to expiry and saves the rotated pair", async () => {
-    let clock = Date.now();
-    const { profiles, tokens, signIn } = await setup({ "code-a": alice }, () => clock);
+  it("never refreshes a long-lived token", async () => {
+    const { profiles, anthropic, signIn } = await setup({ "code-a": alice });
+    await signIn("code-a");
+    await profiles.spawnEnvironment();
+    await profiles.handle({ action: "list", refreshUsage: true });
+    const grants = anthropic.fetch.mock.calls
+      .filter(([url]) => url === CLAUDE_OAUTH.tokenUrl)
+      .map(([, init]) => (JSON.parse(String(init?.body)) as { grant_type: string }).grant_type);
+    expect(grants).toEqual(["authorization_code"]);
+  });
+
+  it("still refreshes a refreshable token close to expiry and saves the rotated pair", async () => {
+    const clock = Date.now();
+    const { profiles, tokens, anthropic, signIn } = await setup({ "code-a": alice }, () => clock);
     const state = await signIn("code-a");
     const id = defined(state.activeProfileId);
-    const original = defined(tokens.values.get(id));
-    clock = original.expiresAt - 60_000;
+    const original = anthropic.issueRefreshable(alice, clock + 60_000);
+    tokens.values.set(id, original);
     const spawn = await profiles.spawnEnvironment();
     const saved = defined(tokens.values.get(id));
     expect(saved.refreshToken).not.toBe(original.refreshToken);
     expect(defined(spawn).apply({}).CLAUDE_CODE_OAUTH_TOKEN).toBe(saved.accessToken);
   });
 
-  it("marks a revoked sign-in expired and moves to the next account", async () => {
+  it("a long-lived token past its expiry is marked expired and the next account takes over", async () => {
     let clock = Date.now();
-    const { profiles, tokens, anthropic, signIn } = await setup(
+    const { profiles, tokens, signIn } = await setup(
       { "code-a": alice, "code-b": bob },
       () => clock,
     );
     await signIn("code-a");
     await signIn("code-b");
     const aliceId = defined((await profiles.state()).activeProfileId);
-    clock = defined(tokens.values.get(aliceId)).expiresAt - 60_000;
-    anthropic.revoke("alice");
-    // Bob's token is still fresh relative to its own expiry window.
+    clock = defined(defined(tokens.values.get(aliceId)).expiresAt) + 1;
     for (const [id, value] of tokens.values) {
-      if (id !== aliceId) tokens.values.set(id, { ...value, expiresAt: clock + 8 * 3_600_000 });
+      if (id !== aliceId) tokens.values.set(id, { ...value, expiresAt: clock + 86_400_000 });
     }
+    const spawn = await profiles.spawnEnvironment();
+    expect(defined(spawn).apply({}).CLAUDE_CODE_OAUTH_TOKEN).toMatch(/^access-bob-/u);
+    const state = await profiles.state();
+    expect(state.profiles.find((item) => item.profileId === aliceId)?.status).toBe("expired");
+    expect(state.lastSwitch).toMatchObject({ fromProfileId: aliceId, reason: "auto" });
+  });
+
+  it("a long-lived token Claude rejects is marked expired and the next account takes over", async () => {
+    const { profiles, anthropic, signIn } = await setup({ "code-a": alice, "code-b": bob });
+    await signIn("code-a");
+    await signIn("code-b");
+    const aliceId = defined((await profiles.state()).activeProfileId);
+    anthropic.revoke("alice");
+    await profiles.handle({ action: "list", refreshUsage: true });
     const spawn = await profiles.spawnEnvironment();
     expect(defined(spawn).apply({}).CLAUDE_CODE_OAUTH_TOKEN).toMatch(/^access-bob-/u);
     const state = await profiles.state();
@@ -263,6 +337,22 @@ describe("Claude account profiles", () => {
     expect(tokens.values.size).toBe(0);
   });
 
+  it("saves a pasted setup-token even though it cannot read the profile or usage", async () => {
+    const { profiles, anthropic } = await setup({});
+    const token = anthropic.setupToken(carol);
+    const state = await profiles.handle({ action: "token.add", token: `  ${token}\n` });
+    expect(state.profiles).toHaveLength(1);
+    const [profile] = state.profiles;
+    expect(profile).toMatchObject({ label: "Claude (…xxxx)", status: "ready", active: true });
+    expect(profile).not.toHaveProperty("error");
+    expect(profile).not.toHaveProperty("expiresAt");
+    const spawn = await profiles.spawnEnvironment();
+    expect(defined(spawn).apply({}).CLAUDE_CODE_OAUTH_TOKEN).toBe(token);
+    await expect(
+      profiles.handle({ action: "token.add", token: "not-a-claude-token-at-all" }),
+    ).rejects.toThrow(/sk-ant-oat/u);
+  });
+
   it("rejects a pasted code from another sign-in", async () => {
     const { profiles } = await setup({ "code-a": alice });
     const started = await profiles.handle({ action: "login.start", mode: "manual" });
@@ -284,5 +374,26 @@ describe("parsePastedAuthorization", () => {
       code: "abc",
       state: "xyz",
     });
+  });
+});
+
+describe("Claude token file store", () => {
+  it("round-trips long-lived and refreshable tokens on every platform", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "claude-tokens-"));
+    directories.push(directory);
+    const store = createClaudeTokenStore(directory);
+    await store.write("c1", { accessToken: "sk-ant-oat01-a", scopes: [] });
+    await store.write("c2", {
+      accessToken: "access",
+      refreshToken: "refresh",
+      expiresAt: 42,
+      scopes: ["user:inference"],
+    });
+    expect(await store.read("c1")).toEqual({ accessToken: "sk-ant-oat01-a", scopes: [] });
+    expect(await store.read("c2")).toMatchObject({ refreshToken: "refresh", expiresAt: 42 });
+    await store.write("c1", { accessToken: "sk-ant-oat01-b", scopes: [] });
+    expect((await store.read("c1"))?.accessToken).toBe("sk-ant-oat01-b");
+    await store.delete("c1");
+    expect(await store.read("c1")).toBeNull();
   });
 });

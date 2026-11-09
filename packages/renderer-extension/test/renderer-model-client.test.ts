@@ -426,6 +426,7 @@ describe("Renderer fixed Model request client", () => {
       "getHarnessDisplaySettings",
       "getHarnessLaunchSettings",
       "getHarnessPreferences",
+      "harnessAccountProfiles",
       "importHarnessSession",
       "inspectCodexAccountUsage",
       "inspectHarness",

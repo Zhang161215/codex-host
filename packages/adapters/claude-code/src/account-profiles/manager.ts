@@ -13,7 +13,9 @@ import type { ClaudePlanLimitEvent } from "../transport.js";
 import { ClaudeLoginFlow, type ClaudeLoginResult } from "./login.js";
 import {
   ClaudeOAuthError,
+  fetchClaudeProfile,
   fetchClaudeUsage,
+  parseClaudeAccessToken,
   refreshClaudeTokens,
   type ClaudeOAuthTokens,
   type ClaudeOAuthUsage,
@@ -30,7 +32,7 @@ import {
 
 const CLAUDE_CODE_HARNESS_ID = harnessIdSchema.parse("claude-code");
 
-/** Refresh an access token this long before it expires, so a new Turn never starts on a stale one. */
+/** Refresh a refreshable token this long before it expires, so a Turn never starts on a stale one. */
 const REFRESH_MARGIN_MS = 30 * 60_000;
 const USAGE_FRESH_MS = 60_000;
 const AUTO_SWITCH_COOLDOWN_MS = 2 * 60_000;
@@ -44,7 +46,6 @@ export interface ClaudeProfileSpawnEnvironment {
 export interface ClaudeAccountProfilesOptions {
   environment: NodeJS.ProcessEnv;
   fetch?: FetchLike;
-  platform?: NodeJS.Platform;
   tokenStore?: ClaudeTokenStore;
   now?: () => number;
 }
@@ -83,7 +84,7 @@ export class ClaudeAccountProfiles implements HarnessAccountProfilesCapability {
   constructor(options: ClaudeAccountProfilesOptions) {
     const directory = claudeAccountsDirectory(options.environment);
     this.#metadata = new ClaudeProfileMetadataStore(directory);
-    this.#tokens = options.tokenStore ?? createClaudeTokenStore(directory, options.platform);
+    this.#tokens = options.tokenStore ?? createClaudeTokenStore(directory);
     this.#fetch = options.fetch ?? ((input, init) => fetch(input, init));
     this.#now = options.now ?? Date.now;
     this.#login = new ClaudeLoginFlow(this.#fetch, (result) => this.#saveLogin(result));
@@ -115,6 +116,9 @@ export class ClaudeAccountProfiles implements HarnessAccountProfilesCapability {
       case "login.cancel":
         this.#login.cancel(request.loginId);
         break;
+      case "token.add":
+        await this.#addToken(request.token);
+        break;
       case "activate":
         await this.#activate(request.profileId, "manual");
         break;
@@ -139,6 +143,14 @@ export class ClaudeAccountProfiles implements HarnessAccountProfilesCapability {
 
   async state(): Promise<HarnessAccountProfilesState> {
     const data = await this.#metadata.read();
+    const expiries = new Map(
+      await Promise.all(
+        data.profiles.map(
+          async (profile) =>
+            [profile.profileId, (await this.#tokens.read(profile.profileId))?.expiresAt] as const,
+        ),
+      ),
+    );
     return {
       harnessId: CLAUDE_CODE_HARNESS_ID,
       activeProfileId: data.activeProfileId,
@@ -155,12 +167,23 @@ export class ClaudeAccountProfiles implements HarnessAccountProfilesCapability {
         ...(profile.usage?.fiveHour ? { fiveHour: profile.usage.fiveHour } : {}),
         ...(profile.usage?.sevenDay ? { sevenDay: profile.usage.sevenDay } : {}),
         ...(profile.usage ? { usageObservedAt: profile.usage.observedAt } : {}),
+        ...(expiries.get(profile.profileId) !== undefined
+          ? { expiresAt: new Date(expiries.get(profile.profileId) ?? 0).toISOString() }
+          : {}),
         ...(profile.error ? { error: profile.error } : {}),
       })),
     };
   }
 
-  async #saveLogin(result: ClaudeLoginResult): Promise<string> {
+  /** Saves a token created elsewhere; its lifetime is unknown until Claude rejects it. */
+  async #addToken(value: string): Promise<void> {
+    const accessToken = parseClaudeAccessToken(value);
+    // `claude setup-token` grants inference only, so the profile lookup may be refused.
+    const profile = await fetchClaudeProfile(this.#fetch, accessToken).catch(() => ({}));
+    await this.#saveLogin({ tokens: { accessToken, scopes: [] }, profile }, accessToken.slice(-4));
+  }
+
+  async #saveLogin(result: ClaudeLoginResult, tokenHint?: string): Promise<string> {
     const { tokens, profile } = result;
     const profileId = await this.#mutate(async (data) => {
       const existing = profile.accountUuid
@@ -181,7 +204,9 @@ export class ClaudeAccountProfiles implements HarnessAccountProfilesCapability {
         data.profiles.push({
           profileId: id,
           label:
-            profile.email ?? profile.displayName ?? `Claude account ${data.profiles.length + 1}`,
+            profile.email ??
+            profile.displayName ??
+            (tokenHint ? `Claude (…${tokenHint})` : `Claude account ${data.profiles.length + 1}`),
           ...(profile.email ? { email: profile.email } : {}),
           ...(profile.plan ? { plan: profile.plan } : {}),
           ...(profile.accountUuid ? { accountUuid: profile.accountUuid } : {}),
@@ -249,7 +274,14 @@ export class ClaudeAccountProfiles implements HarnessAccountProfilesCapability {
       await this.#markExpired(profileId, "The saved sign-in is missing");
       throw new Error("The saved sign-in is missing; sign in to this account again");
     }
-    if (!force && stored.expiresAt - this.#now() > REFRESH_MARGIN_MS) return stored;
+    const remaining = stored.expiresAt === undefined ? Infinity : stored.expiresAt - this.#now();
+    if (!force && remaining > REFRESH_MARGIN_MS) return stored;
+    if (!stored.refreshToken) {
+      // Long-lived tokens are used as they are until they expire or Claude rejects them.
+      if (!force && remaining > 0) return stored;
+      await this.#markExpired(profileId, "Sign-in expired or was revoked");
+      throw new Error("This Claude account's sign-in expired; sign in to it again");
+    }
     const running = this.#refreshFlights.get(profileId);
     if (running) return running;
     const flight = (async () => {
@@ -290,7 +322,11 @@ export class ClaudeAccountProfiles implements HarnessAccountProfilesCapability {
           usage = await fetchClaudeUsage(this.#fetch, tokens.accessToken);
         }
       } catch (error) {
-        failure = message(error, "Usage lookup failed");
+        // A token without the profile scope (`claude setup-token`) cannot read usage; its quota
+        // still arrives from the native sessions that run under it.
+        if (!(error instanceof ClaudeOAuthError && error.status === 403)) {
+          failure = message(error, "Usage lookup failed");
+        }
       }
       await this.#mutate((next) => {
         const target = next.profiles.find((item) => item.profileId === profileId);
@@ -299,8 +335,8 @@ export class ClaudeAccountProfiles implements HarnessAccountProfilesCapability {
           target.usage = { ...usage, observedAt: new Date(this.#now()).toISOString() };
           if (target.status === "error") target.status = "ready";
           delete target.error;
-        } else if (target.status !== "expired") {
-          target.error = failure ?? "Usage lookup failed";
+        } else if (failure && target.status !== "expired") {
+          target.error = failure;
         }
       });
     })().finally(() => this.#usageFlights.delete(profileId));
@@ -327,6 +363,11 @@ export class ClaudeAccountProfiles implements HarnessAccountProfilesCapability {
     if (profileId === null) return null;
     let tokens: ClaudeOAuthTokens;
     try {
+      // A long-lived token Claude has rejected stays rejected until its account signs in again.
+      const profile = data.profiles.find((item) => item.profileId === profileId);
+      if (profile?.status === "expired") {
+        throw new Error("This Claude account's sign-in expired; sign in to it again");
+      }
       tokens = await this.#tokensFor(profileId);
     } catch (error) {
       if (data.autoSwitch.enabled && (await this.#switchAway(profileId))) {

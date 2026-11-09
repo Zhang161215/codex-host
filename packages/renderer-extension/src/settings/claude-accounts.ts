@@ -203,6 +203,17 @@ export function mountClaudeAccounts(
     return element;
   };
 
+  const EXPIRY_WARNING_MS = 30 * 86_400_000;
+  const expiryText = (expiresAt: string | undefined): string => {
+    if (!expiresAt) return "";
+    const date = new Intl.DateTimeFormat(settings.locale, { dateStyle: "medium" }).format(
+      new Date(expiresAt),
+    );
+    return Date.parse(expiresAt) - Date.now() < EXPIRY_WARNING_MS
+      ? fill(messages.expiresSoon, { date })
+      : fill(messages.expiresOn, { date });
+  };
+
   const metaLine = (parts: string[]): HTMLElement => {
     const meta = document.createElement("div");
     meta.className = "settings-account-metadata";
@@ -290,7 +301,7 @@ export function mountClaudeAccounts(
       metaLine([
         profile.email && profile.email !== profile.label ? shown(profile.email) : "",
         profile.plan ? profile.plan.toUpperCase() : "",
-        statusText,
+        statusText || expiryText(profile.expiresAt),
       ]),
     );
     const usage = document.createElement("div");
@@ -419,6 +430,15 @@ export function mountClaudeAccounts(
     const submit = actionButton(messages.loginSubmit, () => {
       const code = input.value.trim();
       if (!code) return;
+      if (/^sk-ant-/u.test(code)) {
+        // A ready-made token (`claude setup-token`) replaces the browser sign-in.
+        void request({ action: "token.add", token: code }).then((ok) => {
+          if (!ok) return;
+          notice = messages.tokenAdded;
+          void request({ action: "login.cancel", loginId: pending.loginId }, true);
+        });
+        return;
+      }
       void request({ action: "login.complete", loginId: pending.loginId, code }).then((ok) => {
         if (ok && state?.login?.status === "completed") {
           const profile = state.profiles.find((item) => item.profileId === state?.login?.profileId);
