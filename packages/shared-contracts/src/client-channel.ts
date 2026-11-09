@@ -62,6 +62,7 @@ export const CLIENT_CHANNEL_METHODS = [
   "codexhost/harness/accounts/list",
   "codexhost/harness/accounts/inspect",
   "codexhost/harness/credential-imports",
+  "codexhost/harness/account-profiles",
   "codexhost/account/list",
   "codexhost/account/refresh",
   "codexhost/account/usage/inspect",

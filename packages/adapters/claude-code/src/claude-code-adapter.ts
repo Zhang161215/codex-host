@@ -61,6 +61,7 @@ import {
   type TurnStartCommand,
   type TurnSteerAccepted,
   type TurnSteerCommand,
+  type HarnessAccountProfilesCapability,
 } from "@codexhost/harness-adapter";
 import {
   accountCreditsSnapshotSchema,
@@ -110,6 +111,10 @@ import {
 } from "./permission-modes.js";
 import { ClaudeSdkModelInspector, ClaudeSdkTransport } from "./sdk-transport.js";
 import {
+  ClaudeAccountProfiles,
+  type ClaudeProfileSpawnEnvironment,
+} from "./account-profiles/manager.js";
+import {
   CLAUDE_DEFAULT_THINKING_OPTION_ID,
   CLAUDE_THINKING_OPTIONS,
   parseClaudeThinkingOptionId,
@@ -142,6 +147,8 @@ import type {
 export interface ClaudeCodeAdapterOptions {
   command?: string;
   environment?: NodeJS.ProcessEnv;
+  /** Saved sign-ins; defaults to the codexhost store unless test dependencies are injected. */
+  accountProfiles?: ClaudeAccountProfiles | null;
   closeTimeoutMs?: number;
   cancelTimeoutMs?: number;
   toolOutputLimit?: number;
@@ -612,6 +619,10 @@ class ClaudeHarnessSession implements HarnessSession {
   #pendingClaimed = false;
   #submittedInput = false;
   #startupTask: Promise<ClaudeTurnTransport> | null = null;
+  readonly #sessionEnvironment: NodeJS.ProcessEnv;
+  readonly #resolveSignIn: (() => Promise<ClaudeProfileSpawnEnvironment | null>) | null;
+  /** The sign-in the live transport was started under; a change restarts it at an idle Turn. */
+  #transportSignInKey: string | null = null;
   readonly #randomUUID: () => string;
   #requestedModel: HarnessModelRef | undefined;
   #requestedPermissionModeId: HarnessPermissionModeId;
@@ -662,6 +673,10 @@ class ClaudeHarnessSession implements HarnessSession {
     onPlanLimitObserved: (planLimit: ClaudePlanLimitEvent) => ClaudePlanLimitEvent | null,
     options: {
       environment?: NodeJS.ProcessEnv;
+      /** The Adapter environment a sign-in override is applied to when `environment` is absent. */
+      baseEnvironment: NodeJS.ProcessEnv;
+      /** The saved sign-in a new native process must run under; null keeps Claude Code's own. */
+      resolveSignIn?: () => Promise<ClaudeProfileSpawnEnvironment | null>;
       bypassPermissionsAvailable: boolean;
       openMode: "create" | "resume";
       sessionId: string;
@@ -695,8 +710,10 @@ class ClaudeHarnessSession implements HarnessSession {
     this.#pendingSessions = options.pendingSessions;
     const environment = options.environment;
     this.#createTransport = environment
-      ? (input) => dependencies.createTransport({ ...input, environment })
+      ? (input) => dependencies.createTransport({ environment, ...input })
       : dependencies.createTransport;
+    this.#sessionEnvironment = environment ?? options.baseEnvironment;
+    this.#resolveSignIn = options.resolveSignIn ?? null;
     this.#bypassPermissionsAvailable = options.bypassPermissionsAvailable;
     this.#randomUUID = dependencies.randomUUID;
     this.#readSessionMessages = dependencies.readSessionMessages;
@@ -1763,8 +1780,9 @@ class ClaudeHarnessSession implements HarnessSession {
 
   #ensureTransport(): Promise<ClaudeTurnTransport> {
     if (this.#startupTask) return this.#startupTask;
-    if (this.#transport) return Promise.resolve(this.#transport);
-    const task = this.#startTransport();
+    const current = this.#transport;
+    if (current && !this.#resolveSignIn) return Promise.resolve(current);
+    const task = current ? this.#reuseOrRestartTransport(current) : this.#startTransport();
     this.#startupTask = task;
     void task
       .finally(() => {
@@ -1774,7 +1792,37 @@ class ClaudeHarnessSession implements HarnessSession {
     return task;
   }
 
-  async #startTransport(): Promise<ClaudeTurnTransport> {
+  /** Whether the native process can be replaced without losing running Turn or background work. */
+  #transportIdle(): boolean {
+    return (
+      this.#active === null &&
+      this.#autonomousTarget === null &&
+      this.#hardCancelTask === null &&
+      this.#configurationTask === null &&
+      !this.#occupancy.unsettled &&
+      this.#backgroundCommands.taskIds().length === 0
+    );
+  }
+
+  /**
+   * A switched account applies from the next Turn: the idle native process is closed and the
+   * same native Session resumes under the new sign-in. Busy processes keep their sign-in.
+   */
+  async #reuseOrRestartTransport(current: ClaudeTurnTransport): Promise<ClaudeTurnTransport> {
+    const signIn = await this.#resolveSignIn?.();
+    if ((signIn?.key ?? null) === this.#transportSignInKey || !this.#transportIdle()) {
+      return current;
+    }
+    if (this.#transport !== current) return this.#transport ?? this.#startTransport(signIn);
+    await current.close();
+    if (this.#transport === current) this.#transport = null;
+    this.#openMode = "resume";
+    return this.#startTransport(signIn);
+  }
+
+  async #startTransport(
+    resolvedSignIn?: ClaudeProfileSpawnEnvironment | null,
+  ): Promise<ClaudeTurnTransport> {
     if (this.#openMode === "create" && isPendingClaudeSession(this.#nativeRef)) {
       await this.#pendingSessions.claim(this.#nativeRef, this.#cwd);
       this.#pendingClaimed = true;
@@ -1787,9 +1835,12 @@ class ClaudeHarnessSession implements HarnessSession {
       this.#requestedModel ?? (this.#openMode === "create" ? CLAUDE_DEFAULT_MODEL_REF : undefined);
     const model = selectedModel ? decodeClaudeModelRef(selectedModel) : undefined;
     const permissionMode = decodeClaudePermissionModeId(this.#requestedPermissionModeId);
+    const signIn =
+      resolvedSignIn !== undefined ? resolvedSignIn : ((await this.#resolveSignIn?.()) ?? null);
     let transport: ClaudeTurnTransport;
     try {
       transport = this.#createTransport({
+        ...(signIn ? { environment: signIn.apply(this.#sessionEnvironment) } : {}),
         cwd: this.#cwd,
         sessionId: this.#sessionId,
         openMode: this.#openMode,
@@ -1826,6 +1877,7 @@ class ClaudeHarnessSession implements HarnessSession {
         },
       });
       await transport.start();
+      this.#transportSignInKey = signIn?.key ?? null;
       this.#state = {
         ...this.#configuredState(true),
         effectivePermissionModeId: encodeClaudePermissionModeId(transport.getPermissionMode()),
@@ -3040,6 +3092,8 @@ export class ClaudeCodeAdapter implements HarnessAdapter {
       this.#importScope.resolve((signal) => this.#importIndex.resolve(nativeSessionId, signal)),
   } satisfies HarnessSessionImportCapability);
   readonly usageStatistics: ReturnType<typeof createClaudeUsageStatistics>;
+  readonly accountProfiles?: HarnessAccountProfilesCapability;
+  readonly #profiles: ClaudeAccountProfiles | null;
   readonly subagents = {
     readSnapshot: async (input: {
       parent: NativeSessionRef;
@@ -3115,6 +3169,16 @@ export class ClaudeCodeAdapter implements HarnessAdapter {
   constructor(options: ClaudeCodeAdapterOptions = {}, dependencies?: ClaudeAdapterDependencies) {
     const environment = options.environment ?? process.env;
     this.#environment = environment;
+    this.#profiles =
+      options.accountProfiles !== undefined
+        ? options.accountProfiles
+        : dependencies
+          ? null
+          : new ClaudeAccountProfiles({ environment });
+    if (this.#profiles) {
+      const profiles = this.#profiles;
+      this.accountProfiles = { handle: (request) => profiles.handle(request) };
+    }
     this.#importIndex = new ClaudeSessionImportIndex(environment);
     this.usageStatistics = createClaudeUsageStatistics(environment);
     this.#pendingSessions = new ClaudePendingSessions(environment);
@@ -3149,7 +3213,7 @@ export class ClaudeCodeAdapter implements HarnessAdapter {
         new ClaudeSdkModelInspector({
           ...input,
           ...(options.command ? { command: options.command } : {}),
-          environment: options.environment ?? process.env,
+          environment: input.environment ?? options.environment ?? process.env,
           closeTimeoutMs: this.#closeTimeoutMs,
         }),
       createTransport: (input) =>
@@ -3233,6 +3297,17 @@ export class ClaudeCodeAdapter implements HarnessAdapter {
     const planLimitAtStart = this.#latestPlanLimit;
     let inspector: ClaudeModelInspector | undefined;
     try {
+      // A saved sign-in reports its own quota; Claude Code's native login is not the one in use.
+      const profileAccount = await this.#profiles?.activeAccountSnapshot();
+      if (profileAccount !== undefined) {
+        if (this.#latestPlanLimit === planLimitAtStart) {
+          this.#accountCreditsSupported = profileAccount?.credits !== undefined;
+          for (const session of this.#sessions) {
+            session.publishAccountCreditsSupport(this.#accountCreditsSupported);
+          }
+        }
+        return profileAccount;
+      }
       this.#dependencies.inspectInstallation();
       inspector = this.#dependencies.createInspector({ cwd: process.cwd() });
       this.#inspectors.add(inspector);
@@ -3262,7 +3337,15 @@ export class ClaudeCodeAdapter implements HarnessAdapter {
     try {
       this.#dependencies.inspectInstallation();
       stage = "startup";
-      inspector = this.#dependencies.createInspector({ cwd });
+      // Only a saved sign-in defers creation; the Inspector must be tracked before close can run.
+      const signIn = this.#profiles
+        ? await this.#profiles.spawnEnvironment().catch(() => null)
+        : null;
+      if (this.#closePromise) throw new Error("Claude Code Adapter is closing");
+      inspector = this.#dependencies.createInspector({
+        cwd,
+        ...(signIn ? { environment: signIn.apply(this.#environment) } : {}),
+      });
       this.#inspectors.add(inspector);
       stage = "model-catalog";
       const snapshot = await inspector.inspect();
@@ -3540,6 +3623,10 @@ export class ClaudeCodeAdapter implements HarnessAdapter {
       (planLimit) => this.#recordPlanLimit(session, planLimit),
       {
         ...(environment ? { environment } : {}),
+        baseEnvironment: this.#environment,
+        ...(this.#profiles
+          ? { resolveSignIn: () => this.#profiles?.spawnEnvironment() ?? Promise.resolve(null) }
+          : {}),
         bypassPermissionsAvailable,
         openMode,
         pendingSessions: this.#pendingSessions,
@@ -3591,6 +3678,7 @@ export class ClaudeCodeAdapter implements HarnessAdapter {
     origin: ClaudeHarnessSession,
     planLimit: ClaudePlanLimitEvent,
   ): ClaudePlanLimitEvent | null {
+    this.#profiles?.observePlanLimit(planLimit);
     const next: ClaudePlanLimitEvent = { ...(this.#latestPlanLimit ?? {}) };
     if (planLimit.fiveHour) next.fiveHour = planLimit.fiveHour;
     if (planLimit.sevenDay) next.sevenDay = planLimit.sevenDay;
@@ -3619,6 +3707,7 @@ export class ClaudeCodeAdapter implements HarnessAdapter {
   close(): Promise<void> {
     if (!this.#closePromise) {
       this.#inspectionCache.clear();
+      this.#profiles?.close();
       this.#closePromise = Promise.all([
         this.#importScope.close(),
         ...[...this.#inspectors].map((inspector) => inspector.close()),

@@ -20,11 +20,17 @@ import type {
   NativeCheckpointRef,
   NativeSessionRef,
   NativeTurnRef,
+  HarnessAccountProfilesRequest,
+  HarnessAccountProfilesState,
 } from "@codexhost/shared-contracts";
 
 import type { HostUsage, HostUsageRequest } from "./usage.js";
 import type { HarnessSessionUsageCapability } from "./session-usage.js";
 import type { HarnessCredentialExport, HarnessCredentialImports } from "./credential-imports.js";
+
+export interface HarnessAccountProfilesCapability {
+  handle(request: HarnessAccountProfilesRequest): Promise<HarnessAccountProfilesState>;
+}
 
 export type {
   HarnessInspection,
@@ -708,6 +714,11 @@ export interface HarnessAdapter {
    * this method and retains the first snapshot as the compatibility `account`.
    */
   inspectAccounts?(): Promise<readonly HarnessAccountSnapshot[]>;
+  /**
+   * Saved sign-ins the Adapter stores and runs native sessions under. Optional; Host routes the
+   * settings request here by Harness ID. Errors must be safe to show and never carry tokens.
+   */
+  readonly accountProfiles?: HarnessAccountProfilesCapability;
 
   inspect(input?: InspectHarnessInput): Promise<HarnessInspection>;
   open(input: OpenSessionInput): Promise<HarnessResult<HarnessSession>>;

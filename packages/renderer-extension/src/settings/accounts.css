@@ -712,6 +712,130 @@
     grid-column: 2;
   }
 }
+/* Saved Claude Code sign-ins: Pi section card language plus quota meters and a switch footer. */
+.settings-claude-accounts__row {
+  grid-template-columns: 34px minmax(0, 1.1fr) minmax(0, 1.4fr) auto;
+}
+.settings-claude-accounts__row[data-active="true"] {
+  background: light-dark(#f6f4fd, #29273a);
+}
+.settings-claude-accounts__usage {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0 16px;
+  min-width: 0;
+}
+.settings-claude-accounts__usage .settings-account-usage__meter {
+  grid-template-rows: 18px 4px 15px;
+}
+.settings-claude-accounts__badge {
+  padding: 3px 8px;
+  color: light-dark(#5b4bb7, #c8bfff);
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+  background: light-dark(#ece8fb, #35314f);
+  border-radius: 999px;
+}
+.settings-claude-accounts__rename {
+  width: 100%;
+  min-height: 26px;
+  padding: 2px 6px;
+  color: var(--settings-text);
+  font: inherit;
+  font-size: 13px;
+  background: transparent;
+  border: 1px solid var(--settings-border);
+  border-radius: 6px;
+}
+.settings-claude-accounts__login {
+  display: grid;
+  gap: 10px;
+  margin-bottom: 12px;
+  padding: 14px 16px;
+  font-size: 12px;
+  background: light-dark(#f6f4fd, #29273a);
+  border: 1px solid var(--account-border, light-dark(#e2e2e8, #36363b));
+  border-radius: 11px;
+}
+.settings-claude-accounts__login[hidden],
+.settings-claude-accounts__footer[hidden],
+.settings-claude-accounts__notice[hidden] {
+  display: none;
+}
+.settings-claude-accounts__login p {
+  margin: 0;
+  color: var(--settings-text);
+}
+.settings-claude-accounts__paste {
+  display: grid;
+  gap: 6px;
+  color: var(--settings-muted);
+}
+.settings-claude-accounts__paste input {
+  min-height: 28px;
+  padding: 4px 8px;
+  color: var(--settings-text);
+  font: inherit;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  background: light-dark(#ffffff, #232326);
+  border: 1px solid var(--settings-border);
+  border-radius: 6px;
+}
+.settings-claude-accounts__login-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.settings-claude-accounts__login-actions a {
+  text-decoration: none;
+}
+.settings-claude-accounts__footer {
+  display: grid;
+  gap: 6px;
+  padding: 12px 2px 0;
+  font-size: 12px;
+}
+.settings-claude-accounts__controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 20px;
+}
+.settings-claude-accounts__auto,
+.settings-claude-accounts__threshold {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--settings-text);
+}
+.settings-claude-accounts__threshold select {
+  min-height: 26px;
+  color: var(--settings-text);
+  font: inherit;
+  background: light-dark(#ffffff, #232326);
+  border: 1px solid var(--settings-border);
+  border-radius: 6px;
+}
+.settings-claude-accounts__help,
+.settings-claude-accounts__notice {
+  margin: 0;
+  color: var(--settings-muted);
+  font-size: 11px;
+}
+.settings-claude-accounts__notice {
+  padding: 8px 2px 0;
+}
+@container (max-width: 680px) {
+  .settings-claude-accounts__row {
+    grid-template-columns: 34px minmax(0, 1fr);
+  }
+  .settings-claude-accounts__usage,
+  .settings-claude-accounts__row .settings-pi-accounts__actions {
+    grid-column: 2;
+  }
+}
 .settings-credential-dialog {
   width: min(420px, calc(100vw - 40px));
 }

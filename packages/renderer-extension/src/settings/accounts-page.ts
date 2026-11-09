@@ -21,6 +21,7 @@ import {
   renderHarnessAccountRows,
 } from "./accounts-list.js";
 import { createHarnessAccounts, type RendererHarnessAccountClient } from "./harness-accounts.js";
+import { mountClaudeAccounts, type RendererClaudeAccountClient } from "./claude-accounts.js";
 import { mountAccountResetCountdowns } from "./accounts-reset-time.js";
 import type { AccountUsageDisplay, AccountUsageViewState } from "./accounts-usage.js";
 import type { RendererSettingsPageDefinition, RendererSettingsPageMountContext } from "./core.js";
@@ -29,7 +30,10 @@ import type { RendererSettingsMessages } from "./localization.js";
 import { shouldApplyCodexAccountSnapshot } from "../renderer-codex-account-state.js";
 
 export interface RendererCodexAccountClient
-  extends RendererHarnessAccountClient, RendererCredentialImportClient {
+  extends
+    RendererHarnessAccountClient,
+    RendererCredentialImportClient,
+    RendererClaudeAccountClient {
   listHarnessPlugins?(): Promise<HarnessPluginListResult>;
   listCodexAccounts(): Promise<CodexAccountListResult>;
   refreshCodexAccounts?(): Promise<CodexAccountListResult>;
@@ -121,6 +125,7 @@ export function createAccountsSettingsPage(
         hideEmails = !hideEmails;
         updatePrivacyToggle();
         credentialImports.setHideEmails(hideEmails);
+        claudeAccounts.setHideEmails(hideEmails);
         render();
       });
       refreshUsage.addEventListener("click", () => {
@@ -128,6 +133,7 @@ export function createAccountsSettingsPage(
         loadUsage(accounts);
         void harnessAccounts?.refresh(true);
         void credentialImports.refresh();
+        claudeAccounts.refresh(true);
       });
       search.addEventListener("input", () => render());
       toolbar.append(connected, privacyToggle, searchWrapper, displayControls, refreshUsage);
@@ -145,7 +151,22 @@ export function createAccountsSettingsPage(
         () => render(),
         pluginFor,
       );
-      context.content.append(header, status, toolbar, list, credentialImports.section);
+      const claudeAccounts = mountClaudeAccounts(
+        context.content,
+        context.signal,
+        getClient,
+        messages.claudeAccounts,
+        messages,
+        pluginFor,
+      );
+      context.content.append(
+        header,
+        status,
+        toolbar,
+        list,
+        claudeAccounts.section,
+        credentialImports.section,
+      );
       const stopCountdowns = mountAccountResetCountdowns(list, messages, context.signal);
 
       let accounts: readonly CodexAccountSummary[] = [];
@@ -354,10 +375,12 @@ export function createAccountsSettingsPage(
           plugins = next;
           render();
           void credentialImports.refresh();
+          claudeAccounts.refresh();
         })
         .catch(() => undefined);
       void harnessAccounts.refresh();
       void credentialImports.refresh();
+      claudeAccounts.refresh();
       load();
       return () => {
         stopCountdowns();

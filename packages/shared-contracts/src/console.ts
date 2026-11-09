@@ -51,6 +51,7 @@ export const CONSOLE_HOST_METHODS = Object.freeze([
   "codexhost/harness/accounts/list",
   "codexhost/harness/accounts/inspect",
   "codexhost/harness/credential-imports",
+  "codexhost/harness/account-profiles",
   "codexhost/harness/session-import/sources",
   "codexhost/harness/session-import/list",
   "codexhost/harness/session-import/import",

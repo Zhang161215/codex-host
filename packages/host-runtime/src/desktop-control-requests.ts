@@ -10,6 +10,9 @@ import {
   WEB_OPEN_METHOD,
   CREDENTIAL_IMPORTS_METHOD,
   credentialImportsParamsSchema,
+  HARNESS_ACCOUNT_PROFILES_METHOD,
+  harnessAccountProfilesParamsSchema,
+  harnessAccountProfilesStateSchema,
   HARNESS_DISPLAY_CAPABILITIES_METHOD,
   HARNESS_DISPLAY_GET_METHOD,
   HARNESS_DISPLAY_SET_METHOD,
@@ -244,6 +247,36 @@ export class DesktopControlRequests {
       request.method === "codexhost/account/refresh"
     ) {
       this.#host.dispatchReply(request, () => this.#host.handleCodexAccountRequest(request));
+      return true;
+    }
+    if (request.method === HARNESS_ACCOUNT_PROFILES_METHOD) {
+      this.#host.dispatchReply(request, async () => {
+        const params = harnessAccountProfilesParamsSchema.safeParse(request.params);
+        if (!params.success) {
+          await this.#host.writeJson(rpcError(request, -32602, "Invalid account profile request"));
+          return;
+        }
+        await this.#host.waitForPlugins();
+        const { harnessId, ...profileRequest } = params.data;
+        const adapter = this.#host.externalAdapters.get(harnessId);
+        if (!adapter?.accountProfiles) {
+          await this.#host.writeJson(
+            rpcError(request, -32077, `Harness '${harnessId}' does not manage account profiles`),
+          );
+          return;
+        }
+        try {
+          const result = harnessAccountProfilesStateSchema.parse(
+            await adapter.accountProfiles.handle(profileRequest),
+          );
+          await this.#host.writeJson(
+            rpcEnvelope(request, { result: jsonValueSchema.parse(result) }),
+          );
+        } catch (error) {
+          // Adapter messages are written for display and never carry token material.
+          await this.#host.writeJson(rpcError(request, -32077, errorMessage(error)));
+        }
+      });
       return true;
     }
     if (request.method === CREDENTIAL_IMPORTS_METHOD) {

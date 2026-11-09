@@ -371,6 +371,8 @@ export interface ClaudeModelInspector {
 
 export interface ClaudeModelInspectorFactoryInput {
   cwd: string;
+  /** Overrides the Adapter environment, e.g. to run under a saved sign-in. */
+  environment?: NodeJS.ProcessEnv;
 }
 
 export interface ClaudeAdapterDependencies {

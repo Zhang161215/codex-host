@@ -82,6 +82,7 @@ export type {
   HostTextInput,
   HostTextQuestion,
   HostToolExecutionItem,
+  HarnessAccountProfilesCapability,
   HostToolOutput,
   HostTurnSnapshot,
   InteractionClosedEvent,

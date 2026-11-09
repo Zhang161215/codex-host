@@ -25,6 +25,7 @@ import {
   type ClaudePermissionMode,
 } from "../src/permission-modes.js";
 import { ClaudeSdkTransport } from "../src/sdk-transport.js";
+import type { ClaudeAccountProfiles } from "../src/account-profiles/manager.js";
 import {
   ClaudeSteerMissedTurnError,
   type ClaudeAdapterDependencies,
@@ -8124,5 +8125,103 @@ describe("Claude Code Workflow runs", () => {
     });
     expect(outputs.some((event) => event.type === "item.started")).toBe(false);
     await session.close();
+  });
+});
+
+function defined<T>(value: T | null | undefined): T {
+  if (value === null || value === undefined) throw new Error("Expected a value");
+  return value;
+}
+
+describe("saved Claude sign-ins", () => {
+  function signInStub() {
+    const signIn = { key: "first" };
+    const profiles = {
+      spawnEnvironment: vi.fn(async () => ({
+        key: signIn.key,
+        apply: (environment: NodeJS.ProcessEnv) => ({
+          ...environment,
+          CLAUDE_CODE_OAUTH_TOKEN: `token-${signIn.key}`,
+        }),
+      })),
+      observePlanLimit: vi.fn(),
+      activeAccountSnapshot: vi.fn(async () => undefined),
+      handle: vi.fn(),
+      close: vi.fn(),
+    };
+    return { signIn, profiles: profiles as unknown as ClaudeAccountProfiles, stub: profiles };
+  }
+
+  it("starts the native process under the active saved sign-in", async () => {
+    const { profiles } = signInStub();
+    const { adapter, dependencies } = fixture({
+      accountProfiles: profiles,
+      environment: { HOME: "/synthetic-home" },
+    });
+    try {
+      const session = await openSession(adapter);
+      await expect(session.execute(textTurn("turn-1"))).resolves.toMatchObject({ ok: true });
+      expect(dependencies.createTransport).toHaveBeenCalledWith(
+        expect.objectContaining({
+          environment: expect.objectContaining({
+            HOME: "/synthetic-home",
+            CLAUDE_CODE_OAUTH_TOKEN: "token-first",
+          }),
+        }),
+      );
+    } finally {
+      await adapter.close();
+    }
+  });
+
+  it("restarts an idle native process after a switch and resumes the same Session", async () => {
+    const { signIn, profiles } = signInStub();
+    const { adapter, dependencies, transports } = fixture({ accountProfiles: profiles });
+    try {
+      const session = await openSession(adapter);
+      await expect(session.execute(textTurn("turn-1"))).resolves.toMatchObject({ ok: true });
+      await vi.waitFor(() => expect(transports[0]?.turns).toHaveLength(1));
+      defined(transports[0]).finish({ status: "succeeded" });
+
+      // Unchanged sign-in: the live process is reused.
+      await vi.waitFor(async () =>
+        expect(await session.execute(textTurn("turn-2"))).toMatchObject({ ok: true }),
+      );
+      await vi.waitFor(() => expect(transports[0]?.turns).toHaveLength(2));
+      expect(transports).toHaveLength(1);
+      defined(transports[0]).finish({ status: "succeeded" });
+
+      signIn.key = "second";
+      await vi.waitFor(async () =>
+        expect(await session.execute(textTurn("turn-3"))).toMatchObject({ ok: true }),
+      );
+      await vi.waitFor(() => expect(transports[1]?.turns).toHaveLength(1));
+      expect(defined(transports[0]).close).toHaveBeenCalled();
+      expect(dependencies.createTransport).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          openMode: "resume",
+          sessionId: defined(transports[0]).sessionId,
+          environment: expect.objectContaining({ CLAUDE_CODE_OAUTH_TOKEN: "token-second" }),
+        }),
+      );
+      defined(transports[1]).finish({ status: "succeeded" });
+    } finally {
+      await adapter.close();
+    }
+  });
+
+  it("forwards native quota pushes to the saved sign-ins", async () => {
+    const { profiles, stub } = signInStub();
+    const { adapter, transports } = fixture({ accountProfiles: profiles });
+    try {
+      const session = await openSession(adapter);
+      await session.execute(textTurn("turn-1"));
+      await vi.waitFor(() => expect(transports[0]?.turns).toHaveLength(1));
+      defined(transports[0]).planLimit({ fiveHour: { utilizationPercent: 97 } });
+      expect(stub.observePlanLimit).toHaveBeenCalledWith({ fiveHour: { utilizationPercent: 97 } });
+      defined(transports[0]).finish({ status: "succeeded" });
+    } finally {
+      await adapter.close();
+    }
   });
 });

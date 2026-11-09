@@ -146,6 +146,11 @@ export const HARNESS_PLUGIN_LIST_METHOD = "codexhost/harness/plugins/list";
 import {
   CREDENTIAL_IMPORTS_METHOD,
   credentialImportsParamsSchema,
+  HARNESS_ACCOUNT_PROFILES_METHOD,
+  harnessAccountProfilesParamsSchema,
+  harnessAccountProfilesStateSchema,
+  type HarnessAccountProfilesParams,
+  type HarnessAccountProfilesState,
   credentialImportsResultSchema,
   type CredentialImportsRequest,
   type CredentialImportsResult,
@@ -265,6 +270,9 @@ export interface RendererModelClient extends Partial<RendererSessionImportClient
   listHarnessAccountSources?(): Promise<HarnessAccountSourceListResult>;
   inspectHarnessAccount?(input: HarnessAccountInspectParams): Promise<HarnessAccountInspectResult>;
   listHarnessAccounts?(input?: HarnessAccountListParams): Promise<HarnessAccountListResult>;
+  harnessAccountProfiles?(
+    params: HarnessAccountProfilesParams,
+  ): Promise<HarnessAccountProfilesState>;
   credentialImports?(
     request: CredentialImportsRequest,
     targetHarnessId?: string,
@@ -649,6 +657,16 @@ export function createRendererModelClient(
         await manager.sendRequest(
           HARNESS_ACCOUNT_INSPECT_METHOD,
           harnessAccountInspectParamsSchema.parse(input),
+        ),
+      );
+    },
+    async harnessAccountProfiles(
+      params: HarnessAccountProfilesParams,
+    ): Promise<HarnessAccountProfilesState> {
+      return harnessAccountProfilesStateSchema.parse(
+        await manager.sendRequest(
+          HARNESS_ACCOUNT_PROFILES_METHOD,
+          harnessAccountProfilesParamsSchema.parse(params),
         ),
       );
     },
