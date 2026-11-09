@@ -1,4 +1,5 @@
 import type {
+  HarnessAccountImportSummary,
   HarnessAccountProfile,
   HarnessAccountProfileWindow,
   HarnessAccountProfilesParams,
@@ -22,6 +23,8 @@ export interface RendererClaudeAccountClient {
 
 const HARNESS_ID = "claude-code";
 const LOGIN_POLL_MS = 2_000;
+/** Matches the Host's limit on an imported file. */
+const IMPORT_LIMIT_BYTES = 3_000_000;
 const THRESHOLDS = [80, 85, 90, 95, 98, 100] as const;
 
 type ProfileAction = HarnessAccountProfilesParams extends infer P
@@ -90,11 +93,19 @@ export function mountClaudeAccounts(
   refresh.title = messages.refresh;
   refresh.setAttribute("aria-label", messages.refresh);
   refresh.append(createRendererSettingsIcon("refresh", 16));
+  const importButton = document.createElement("button");
+  importButton.type = "button";
+  importButton.className = "settings-pi-accounts__import";
+  importButton.append(createRendererSettingsIcon("download", 14), messages.import);
+  const importFile = document.createElement("input");
+  importFile.type = "file";
+  importFile.accept = ".json,application/json";
+  importFile.hidden = true;
   const add = document.createElement("button");
   add.type = "button";
   add.className = "settings-pi-accounts__import";
   add.append(createRendererSettingsIcon("add", 14), messages.add);
-  header.append(fold, hint, refresh, add);
+  header.append(fold, hint, refresh, importButton, importFile, add);
   const card = document.createElement("div");
   card.className = "settings-pi-accounts__card";
   const login = document.createElement("div");
@@ -167,6 +178,41 @@ export function mountClaudeAccounts(
     notice = null;
     void request({ action: "login.start", mode: "callback" });
   });
+  importButton.addEventListener("click", () => importFile.click());
+  importFile.addEventListener("change", () => {
+    const file = importFile.files?.[0];
+    importFile.value = "";
+    if (!file) return;
+    notice = null;
+    if (file.size > IMPORT_LIMIT_BYTES) {
+      notice = messages.importTooLarge;
+      render();
+      return;
+    }
+    void file
+      .text()
+      .then((content) => request({ action: "import", content }))
+      .then((ok) => {
+        const summary = ok ? state?.importSummary : undefined;
+        if (!summary) return;
+        notice = importNotice(summary);
+        render();
+      })
+      .catch((error: unknown) => {
+        notice = fill(messages.failed, { error: errorText(error) });
+        render();
+      });
+  });
+
+  const importNotice = (summary: HarnessAccountImportSummary): string => {
+    const parts = [
+      summary.added ? fill(messages.importAdded, { count: String(summary.added) }) : "",
+      summary.updated ? fill(messages.importUpdated, { count: String(summary.updated) }) : "",
+      summary.skipped ? fill(messages.importSkipped, { count: String(summary.skipped) }) : "",
+      summary.expired ? fill(messages.importExpired, { count: String(summary.expired) }) : "",
+    ].filter(Boolean);
+    return fill(messages.importDone, { parts: parts.join(messages.importSeparator) });
+  };
   refresh.addEventListener("click", () => {
     notice = null;
     void request({ action: "list", refreshUsage: true });
@@ -314,8 +360,11 @@ export function mountClaudeAccounts(
     } else {
       const empty = document.createElement("span");
       empty.className = "settings-account-usage__message";
-      empty.textContent = profile.status === "expired" ? messages.expired : messages.noUsage;
-      usage.append(empty);
+      // An expired row already says so beside its name.
+      if (profile.status !== "expired") {
+        empty.textContent = messages.noUsage;
+        usage.append(empty);
+      }
     }
     const actions = document.createElement("div");
     actions.className = "settings-pi-accounts__actions";
@@ -381,8 +430,35 @@ export function mountClaudeAccounts(
     const label = document.createElement("strong");
     label.className = "settings-account-email";
     label.textContent = messages.native;
-    identity.append(label, metaLine([messages.nativeHint]));
+    // `undefined`: the Host cannot read Claude Code's own login; `null`: it is not signed in.
+    const native = state?.native;
+    identity.append(
+      label,
+      metaLine(
+        native === undefined
+          ? [messages.nativeHint]
+          : native === null
+            ? [messages.nativeMissing]
+            : [
+                native.email ? shown(native.email) : "",
+                native.plan ? native.plan.toUpperCase() : "",
+                native.savedProfileId ? messages.nativeSaved : "",
+              ],
+      ),
+    );
     const spacer = document.createElement("div");
+    spacer.className = "settings-claude-accounts__usage";
+    if (native?.fiveHour || native?.sevenDay) {
+      spacer.append(
+        meter(messages.fiveHour, native.fiveHour),
+        meter(messages.sevenDay, native.sevenDay),
+      );
+    } else if (native) {
+      const empty = document.createElement("span");
+      empty.className = "settings-account-usage__message";
+      empty.textContent = messages.noUsage;
+      spacer.append(empty);
+    }
     const actions = document.createElement("div");
     actions.className = "settings-pi-accounts__actions";
     if (active) actions.append(badge());
@@ -402,13 +478,18 @@ export function mountClaudeAccounts(
     return row;
   };
 
+  // The panel is built once per sign-in, so polling never clears a code being pasted.
+  let loginPanelId: string | null = null;
   const renderLogin = (): void => {
     const pending = state?.login?.status === "pending" ? state.login : null;
     login.hidden = !pending;
     if (!pending) {
+      loginPanelId = null;
       login.replaceChildren();
       return;
     }
+    if (pending.loginId === loginPanelId) return;
+    loginPanelId = pending.loginId;
     const text = document.createElement("p");
     text.textContent = messages.loginPending;
     const open = document.createElement("a");
@@ -417,6 +498,33 @@ export function mountClaudeAccounts(
     open.target = "_blank";
     open.rel = "noopener noreferrer";
     open.textContent = messages.loginOpen;
+    // The code-page link works in any browser or on another device; the code comes back here.
+    const copyUrl = pending.manualAuthorizeUrl ?? pending.authorizeUrl;
+    const link = document.createElement("input");
+    link.type = "text";
+    link.readOnly = true;
+    link.value = copyUrl;
+    link.hidden = true;
+    link.className = "settings-claude-accounts__link";
+    const copy = actionButton(messages.loginCopy, () => {
+      const clipboard = document.defaultView?.navigator.clipboard;
+      const restore = (label: string): void => {
+        copy.textContent = label;
+        document.defaultView?.setTimeout(() => {
+          copy.textContent = messages.loginCopy;
+        }, 2_000);
+      };
+      const reveal = (): void => {
+        restore(messages.loginCopyFailed);
+        link.hidden = false;
+        link.select();
+      };
+      if (!clipboard) {
+        reveal();
+        return;
+      }
+      void clipboard.writeText(copyUrl).then(() => restore(messages.loginCopied), reveal);
+    });
     const manual = document.createElement("label");
     manual.className = "settings-claude-accounts__paste";
     const manualText = document.createElement("span");
@@ -452,8 +560,8 @@ export function mountClaudeAccounts(
     });
     const row = document.createElement("div");
     row.className = "settings-claude-accounts__login-actions";
-    row.append(open, submit, cancel);
-    login.replaceChildren(text, manual, row);
+    row.append(open, copy, submit, cancel);
+    login.replaceChildren(text, link, manual, row);
   };
 
   const renderFooter = (): void => {
@@ -521,17 +629,18 @@ export function mountClaudeAccounts(
     card.hidden = !expanded;
     footer.hidden = !expanded || state.profiles.length === 0;
     renderLogin();
+    // Claude Code's own login is always listed, so this computer's account shows up unasked.
+    const rows = [
+      ...state.profiles.map(renderProfile),
+      renderNative(state.activeProfileId === null),
+    ];
     if (state.profiles.length === 0) {
       const empty = document.createElement("p");
       empty.className = "settings-pi-accounts__empty";
       empty.textContent = messages.empty;
-      card.replaceChildren(empty);
-    } else {
-      card.replaceChildren(
-        ...state.profiles.map(renderProfile),
-        renderNative(state.activeProfileId === null),
-      );
+      rows.unshift(empty);
     }
+    card.replaceChildren(...rows);
     renderFooter();
     status.textContent = notice ?? "";
     status.hidden = !notice;

@@ -772,7 +772,8 @@
   gap: 6px;
   color: var(--settings-muted);
 }
-.settings-claude-accounts__paste input {
+.settings-claude-accounts__paste input,
+.settings-claude-accounts__link {
   min-height: 28px;
   padding: 4px 8px;
   color: var(--settings-text);
@@ -781,6 +782,12 @@
   background: light-dark(#ffffff, #232326);
   border: 1px solid var(--settings-border);
   border-radius: 6px;
+}
+
+.settings-claude-accounts__link {
+  width: 100%;
+  box-sizing: border-box;
+  font-size: 12px;
 }
 .settings-claude-accounts__login-actions {
   display: flex;

@@ -56,6 +56,8 @@ export const harnessAccountLoginSchema = z
   .object({
     loginId: loginIdSchema,
     authorizeUrl: z.string().url().max(4_096),
+    /** Same sign-in for any browser or device: the page shows a code to paste back. */
+    manualAuthorizeUrl: z.string().url().max(4_096).optional(),
     /** `callback` completes on its own; `manual` waits for the pasted authorization code. */
     mode: z.enum(["callback", "manual"]),
     status: z.enum(["pending", "completed", "failed"]),
@@ -75,6 +77,33 @@ export const harnessAccountSwitchSchema = z
   .strict();
 export type HarnessAccountSwitch = z.infer<typeof harnessAccountSwitchSchema>;
 
+/** The sign-in the Harness itself holds on this computer, read without changing it. */
+export const harnessAccountNativeSchema = z
+  .object({
+    email: z.string().trim().min(1).max(320).optional(),
+    plan: z.string().trim().min(1).max(128).optional(),
+    fiveHour: harnessAccountProfileWindowSchema.optional(),
+    sevenDay: harnessAccountProfileWindowSchema.optional(),
+    usageObservedAt: isoDateSchema.optional(),
+    /** A saved profile signed in to the same account. */
+    savedProfileId: profileIdSchema.optional(),
+  })
+  .strict();
+export type HarnessAccountNative = z.infer<typeof harnessAccountNativeSchema>;
+
+export const harnessAccountImportSummarySchema = z
+  .object({
+    added: z.number().int().min(0),
+    /** Saved accounts whose expired sign-in the file replaced. */
+    updated: z.number().int().min(0),
+    /** Already saved and usable, or unusable copies of saved accounts; left unchanged. */
+    skipped: z.number().int().min(0),
+    /** Imported but already unusable; they must sign in again. */
+    expired: z.number().int().min(0),
+  })
+  .strict();
+export type HarnessAccountImportSummary = z.infer<typeof harnessAccountImportSummarySchema>;
+
 export const harnessAccountProfilesStateSchema = z
   .object({
     harnessId: harnessIdSchema,
@@ -84,6 +113,10 @@ export const harnessAccountProfilesStateSchema = z
     autoSwitch: harnessAccountAutoSwitchSchema,
     login: harnessAccountLoginSchema.nullable(),
     lastSwitch: harnessAccountSwitchSchema.nullable(),
+    /** Null when no native sign-in was found; absent when the Harness cannot read it. */
+    native: harnessAccountNativeSchema.nullable().optional(),
+    /** Present only in the reply to an `import` request. */
+    importSummary: harnessAccountImportSummarySchema.optional(),
   })
   .strict();
 export type HarnessAccountProfilesState = z.infer<typeof harnessAccountProfilesStateSchema>;
@@ -107,6 +140,14 @@ export const harnessAccountProfilesParamsSchema = z.discriminatedUnion("action",
     })
     .strict(),
   z.object({ ...target, action: z.literal("login.cancel"), loginId: loginIdSchema }).strict(),
+  /** Saves the accounts found in an exported file; the Adapter recognizes the formats. */
+  z
+    .object({
+      ...target,
+      action: z.literal("import"),
+      content: z.string().min(2).max(3_000_000),
+    })
+    .strict(),
   /** Saves a long-lived token created elsewhere, such as by `claude setup-token`. */
   z
     .object({

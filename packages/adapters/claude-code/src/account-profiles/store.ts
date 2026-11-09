@@ -137,6 +137,9 @@ function parseTokens(text: string): ClaudeOAuthTokens | null {
           ? { refreshToken: value.refreshToken }
           : {}),
         ...(typeof value.expiresAt === "number" ? { expiresAt: value.expiresAt } : {}),
+        ...(typeof value.refreshExpiresAt === "number"
+          ? { refreshExpiresAt: value.refreshExpiresAt }
+          : {}),
         scopes: Array.isArray(value.scopes)
           ? value.scopes.filter((scope): scope is string => typeof scope === "string")
           : [],

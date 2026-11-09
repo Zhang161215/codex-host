@@ -29,6 +29,8 @@ import { webConnectionRequest, WEB_CONNECTION_METHODS } from "./web-client.js";
 
 export const CONSOLE_SERVICE = "codexhost-console";
 const MAX_BODY_BYTES = 16 * 1024;
+/** Host requests can carry a file, such as exported accounts to import. */
+const MAX_HOST_REQUEST_BODY_BYTES = 4 * 1024 * 1024;
 const INSPECT_CACHE_MS = 2_000;
 
 export interface ConsoleServerOptions {
@@ -94,13 +96,16 @@ function sendJson(response: ServerResponse, status: number, value: unknown): voi
 class RequestBodyError extends Error {}
 
 /** Bounded JSON object body; an empty body is `{}`. */
-async function readJsonBody(request: IncomingMessage): Promise<Record<string, unknown>> {
+async function readJsonBody(
+  request: IncomingMessage,
+  maxBytes = MAX_BODY_BYTES,
+): Promise<Record<string, unknown>> {
   let size = 0;
   const chunks: Buffer[] = [];
   for await (const chunk of request) {
     const buffer = chunk as Buffer;
     size += buffer.length;
-    if (size > MAX_BODY_BYTES) throw new RequestBodyError("Request body is too large");
+    if (size > maxBytes) throw new RequestBodyError("Request body is too large");
     chunks.push(buffer);
   }
   if (size === 0) return {};
@@ -345,7 +350,10 @@ export function startConsoleServer(options: ConsoleServerOptions): Promise<Runni
         return;
       }
       try {
-        body = await readJsonBody(request);
+        body = await readJsonBody(
+          request,
+          route === "POST /api/host/request" ? MAX_HOST_REQUEST_BODY_BYTES : MAX_BODY_BYTES,
+        );
       } catch (error) {
         sendJson(response, 400, { error: (error as Error).message });
         return;

@@ -29,6 +29,7 @@ interface PendingLogin {
   pkce: ClaudePkce;
   port: number | null;
   authorizeUrl: string;
+  manualAuthorizeUrl: string;
   servers: http.Server[];
   timer: ReturnType<typeof setTimeout>;
   status: "pending" | "completed" | "failed";
@@ -41,15 +42,23 @@ function page(title: string, body: string): string {
   return `<!doctype html><meta charset="utf-8"><title>${title}</title><body style="font:15px system-ui;margin:48px"><h2>${title}</h2><p>${body}</p></body>`;
 }
 
-/** Reads `code` and `state` from a pasted value: `code#state`, a bare code, or the redirect URL. */
-export function parsePastedAuthorization(value: string): { code: string; state?: string } {
+/**
+ * Reads `code` and `state` from a pasted value: `code#state` from the code page, a bare code, or
+ * a redirect link. `viaCallback` marks a loopback link, whose code belongs to that redirect.
+ */
+export function parsePastedAuthorization(value: string): {
+  code: string;
+  state?: string;
+  viaCallback?: true;
+} {
   const trimmed = value.trim();
   if (/^https?:\/\//iu.test(trimmed)) {
     const url = new URL(trimmed);
     const code = url.searchParams.get("code");
     if (!code) throw new Error("The pasted link does not contain an authorization code");
     const state = url.searchParams.get("state");
-    return { code, ...(state ? { state } : {}) };
+    const loopback = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
+    return { code, ...(state ? { state } : {}), ...(loopback ? { viaCallback: true } : {}) };
   }
   const [code, state] = trimmed.split("#", 2);
   if (!code) throw new Error("Paste the authorization code shown after signing in");
@@ -74,6 +83,9 @@ export class ClaudeLoginFlow {
     return {
       loginId: login.loginId,
       authorizeUrl: login.authorizeUrl,
+      ...(login.manualAuthorizeUrl !== login.authorizeUrl
+        ? { manualAuthorizeUrl: login.manualAuthorizeUrl }
+        : {}),
       mode: login.mode,
       status: login.status,
       ...(login.profileId ? { profileId: login.profileId } : {}),
@@ -115,6 +127,8 @@ export class ClaudeLoginFlow {
       pkce,
       port,
       authorizeUrl: claudeAuthorizeUrl(pkce, port),
+      // The same PKCE pair also works through Anthropic's code page, as in Claude Code.
+      manualAuthorizeUrl: claudeAuthorizeUrl(pkce, null),
       servers,
       timer,
       status: "pending",
@@ -138,7 +152,7 @@ export class ClaudeLoginFlow {
           .end(page("Sign-in failed", "The authorization response was not recognized."));
         return;
       }
-      void this.#finish(login, code).then(() => {
+      void this.#finish(login, code, login.port).then(() => {
         if (login.status === "completed") {
           response.writeHead(302, { Location: SUCCESS_URL }).end();
         } else {
@@ -155,23 +169,24 @@ export class ClaudeLoginFlow {
     if (!login || login.loginId !== loginId || login.status !== "pending") {
       throw new Error("This sign-in is no longer pending; start it again");
     }
-    const { code, state } = parsePastedAuthorization(pasted);
+    const { code, state, viaCallback } = parsePastedAuthorization(pasted);
     if (state !== undefined && state !== login.pkce.state) {
       throw new Error("The pasted code belongs to a different sign-in");
     }
-    await this.#finish(login, code);
+    // A code from the code page was issued for its redirect; a pasted loopback link for ours.
+    await this.#finish(login, code, viaCallback ? login.port : null);
     // `#finish` settles the login; read it back through the snapshot to drop the narrowing.
     if (this.snapshot()?.status === "failed") throw new Error(login.error ?? "Sign-in failed");
   }
 
-  #finish(login: PendingLogin, code: string): Promise<void> {
+  #finish(login: PendingLogin, code: string, port: number | null): Promise<void> {
     if (login.finishing) return login.finishing;
     login.finishing = (async () => {
       try {
         const { tokens, identity } = await exchangeClaudeCode(this.fetchImpl, {
           code,
           pkce: login.pkce,
-          port: login.port,
+          port,
         });
         // The profile adds the plan; the identity from the token response is enough without it.
         const profile = await fetchClaudeProfile(this.fetchImpl, tokens.accessToken).catch(

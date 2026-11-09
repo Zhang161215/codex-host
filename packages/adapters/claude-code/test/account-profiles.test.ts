@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -141,7 +141,12 @@ async function setup(accounts: Record<string, FakeAccount>, now = () => Date.now
   const tokens = memoryTokens();
   const anthropic = fakeAnthropic(accounts);
   const profiles = new ClaudeAccountProfiles({
-    environment: { CODEXHOST_DATA_DIR: directory },
+    // Claude Code's own login is read from here, never from this machine's real one.
+    environment: {
+      CODEXHOST_DATA_DIR: directory,
+      CLAUDE_CONFIG_DIR: path.join(directory, "claude"),
+    },
+    platform: "linux",
     fetch: anthropic.fetch,
     tokenStore: tokens,
     now,
@@ -156,7 +161,62 @@ async function setup(accounts: Record<string, FakeAccount>, now = () => Date.now
       code: `${code}#${state}`,
     });
   };
-  return { profiles, tokens, anthropic, signIn };
+  return { profiles, tokens, anthropic, signIn, directory };
+}
+
+/** Claude Code's own login as it keeps it on disk outside macOS. */
+async function writeNativeLogin(
+  directory: string,
+  account: FakeAccount,
+  tokens?: ClaudeOAuthTokens,
+): Promise<void> {
+  const claude = path.join(directory, "claude");
+  await mkdir(claude, { recursive: true });
+  await writeFile(
+    path.join(claude, ".claude.json"),
+    JSON.stringify({
+      oauthAccount: {
+        accountUuid: account.uuid,
+        organizationUuid: `org-${account.uuid}`,
+        emailAddress: account.email,
+      },
+    }),
+  );
+  if (tokens) {
+    await writeFile(
+      path.join(claude, ".credentials.json"),
+      JSON.stringify({ claudeAiOauth: { ...tokens, subscriptionType: "max" } }),
+    );
+  }
+}
+
+function exportRecord(
+  account: FakeAccount,
+  tokens: ClaudeOAuthTokens,
+  refreshTokenExpiresAt: number,
+) {
+  return {
+    id: `claude_${account.uuid}`,
+    email: account.email,
+    auth_mode: "oauth",
+    account_uuid: account.uuid,
+    organization_uuid: `org-${account.uuid}`,
+    plan_type: "Pro",
+    quota: { five_hour_percentage: 0, seven_day_percentage: 45 },
+    claude_credentials_raw: {
+      claudeAiOauth: {
+        accessToken: tokens.accessToken,
+        refreshToken: tokens.refreshToken,
+        expiresAt: tokens.expiresAt,
+        refreshTokenExpiresAt,
+        scopes: tokens.scopes,
+        subscriptionType: "pro",
+      },
+    },
+    claude_config_raw: {
+      oauthAccount: { accountUuid: account.uuid, emailAddress: account.email },
+    },
+  };
 }
 
 const alice: FakeAccount = {
@@ -227,7 +287,9 @@ describe("Claude account profiles", () => {
     expect(defined(after).apply({}).CLAUDE_CODE_OAUTH_TOKEN).toMatch(/^access-bob-/u);
     const native = await profiles.handle({ action: "activate", profileId: null });
     expect(native.lastSwitch).toMatchObject({ toProfileId: null, reason: "manual" });
-    expect(await profiles.spawnEnvironment()).toBeNull();
+    const own = defined(await profiles.spawnEnvironment());
+    expect(own.key).toMatch(/^native:/u);
+    expect(own.apply({ PATH: "/bin" })).toEqual({ PATH: "/bin" });
   });
 
   it("never refreshes a long-lived token", async () => {
@@ -353,6 +415,120 @@ describe("Claude account profiles", () => {
     ).rejects.toThrow(/sk-ant-oat/u);
   });
 
+  it("offers a copyable code-page link that completes the same sign-in", async () => {
+    const { profiles, anthropic } = await setup({ "code-a": alice });
+    const started = await profiles.handle({ action: "login.start", mode: "callback" });
+    const login = defined(started.login);
+    const loopback = new URL(login.authorizeUrl);
+    const manual = new URL(defined(login.manualAuthorizeUrl));
+    expect(loopback.searchParams.get("redirect_uri")).toMatch(
+      /^http:\/\/localhost:\d+\/callback$/u,
+    );
+    expect(manual.searchParams.get("redirect_uri")).toBe(CLAUDE_OAUTH.manualRedirectUrl);
+    expect(manual.searchParams.get("state")).toBe(loopback.searchParams.get("state"));
+    const done = await profiles.handle({
+      action: "login.complete",
+      loginId: login.loginId,
+      code: `code-a#${manual.searchParams.get("state")}`,
+    });
+    expect(done.login?.status).toBe("completed");
+    expect(anthropic.exchanges[0]).toMatchObject({ redirect_uri: CLAUDE_OAUTH.manualRedirectUrl });
+  });
+
+  it("imports an account manager export and leaves saved accounts alone", async () => {
+    const clock = Date.now();
+    const { profiles, anthropic } = await setup({}, () => clock);
+    const live = anthropic.issueRefreshable(alice, clock + 3_600_000);
+    const dead = anthropic.issueRefreshable(bob, clock - 60_000);
+    const content = JSON.stringify([
+      exportRecord(alice, live, clock + 20 * 86_400_000),
+      exportRecord(bob, dead, clock - 86_400_000),
+    ]);
+    const first = await profiles.handle({ action: "import", content });
+    expect(first.importSummary).toEqual({ added: 1, updated: 0, skipped: 0, expired: 1 });
+    const imported = defined(first.profiles.find((item) => item.email === alice.email));
+    expect(imported).toMatchObject({
+      status: "ready",
+      plan: "pro",
+      active: true,
+      fiveHour: { usedPercent: 20 },
+    });
+    // A refreshable sign-in lasts until its refresh token's fixed deadline.
+    expect(Date.parse(defined(imported.expiresAt))).toBe(clock + 20 * 86_400_000);
+    expect(first.profiles.find((item) => item.email === bob.email)?.status).toBe("expired");
+
+    const again = await profiles.handle({ action: "import", content });
+    expect(again.importSummary).toEqual({ added: 0, updated: 0, skipped: 2, expired: 0 });
+    expect(again.profiles).toHaveLength(2);
+  });
+
+  it("imports Claude Code's credentials file and rejects files without accounts", async () => {
+    const { profiles, anthropic } = await setup({});
+    const tokens = anthropic.issueRefreshable(carol, Date.now() + 3_600_000);
+    const state = await profiles.handle({
+      action: "import",
+      content: JSON.stringify({ claudeAiOauth: { ...tokens, subscriptionType: "max" } }),
+    });
+    expect(state.profiles[0]).toMatchObject({ label: carol.email, plan: "max", status: "ready" });
+    await expect(profiles.handle({ action: "import", content: "not json" })).rejects.toThrow(
+      /not JSON/u,
+    );
+    await expect(profiles.handle({ action: "import", content: '{"hello":1}' })).rejects.toThrow(
+      /No Claude accounts/u,
+    );
+  });
+
+  it("shows this computer's Claude Code login and its quota without refreshing it", async () => {
+    const { profiles, anthropic, directory, signIn } = await setup({ "code-c": carol });
+    await writeNativeLogin(
+      directory,
+      carol,
+      anthropic.issueRefreshable(carol, Date.now() + 3_600_000),
+    );
+    const listed = await profiles.handle({ action: "list", refreshUsage: true });
+    expect(listed.native).toMatchObject({
+      email: carol.email,
+      plan: "max",
+      fiveHour: { usedPercent: 99 },
+    });
+    expect(listed.native).not.toHaveProperty("savedProfileId");
+    const saved = await signIn("code-c");
+    // Adding an account keeps Claude Code's own login in use.
+    expect(saved.activeProfileId).toBeNull();
+    expect(saved.native?.savedProfileId).toBe(saved.profiles[0]?.profileId);
+
+    // An expired native token is read but never refreshed: Claude Code owns it.
+    await writeNativeLogin(
+      directory,
+      carol,
+      anthropic.issueRefreshable(carol, Date.now() - 60_000),
+    );
+    await profiles.handle({ action: "list", refreshUsage: true });
+    const grants = anthropic.fetch.mock.calls
+      .filter(([url]) => url === CLAUDE_OAUTH.tokenUrl)
+      .map(([, init]) => (JSON.parse(String(init?.body)) as { grant_type: string }).grant_type);
+    expect(grants).not.toContain("refresh_token");
+  });
+
+  it("restarts on a native account switch and can move from it to a saved account", async () => {
+    const { profiles, directory, signIn } = await setup({ "code-b": bob });
+    await writeNativeLogin(directory, alice);
+    const state = await signIn("code-b");
+    const bobId = defined(state.profiles[0]).profileId;
+    expect(state.activeProfileId).toBeNull();
+    const before = defined(await profiles.spawnEnvironment());
+    expect(before.key).toContain("alice");
+    expect(before.apply({ PATH: "/bin" })).toEqual({ PATH: "/bin" });
+    // Another tool switches Claude Code's own login.
+    await writeNativeLogin(directory, carol);
+    const after = defined(await profiles.spawnEnvironment());
+    expect(after.key).not.toBe(before.key);
+
+    profiles.observePlanLimit({ sevenDay: { utilizationPercent: 100 } });
+    await vi.waitFor(async () => expect((await profiles.state()).activeProfileId).toBe(bobId));
+    expect((await profiles.state()).native?.sevenDay).toMatchObject({ usedPercent: 100 });
+  });
+
   it("rejects a pasted code from another sign-in", async () => {
     const { profiles } = await setup({ "code-a": alice });
     const started = await profiles.handle({ action: "login.start", mode: "manual" });
@@ -367,13 +543,19 @@ describe("Claude account profiles", () => {
 });
 
 describe("parsePastedAuthorization", () => {
-  it("accepts code#state, a bare code and the redirect link", () => {
+  it("accepts code#state, a bare code and redirect links", () => {
     expect(parsePastedAuthorization(" abc#xyz ")).toEqual({ code: "abc", state: "xyz" });
     expect(parsePastedAuthorization("abc")).toEqual({ code: "abc" });
     expect(parsePastedAuthorization("http://localhost:5555/callback?code=abc&state=xyz")).toEqual({
       code: "abc",
       state: "xyz",
+      viaCallback: true,
     });
+    expect(
+      parsePastedAuthorization(
+        "https://platform.claude.com/oauth/code/callback?code=abc&state=xyz",
+      ),
+    ).toEqual({ code: "abc", state: "xyz" });
   });
 });
 

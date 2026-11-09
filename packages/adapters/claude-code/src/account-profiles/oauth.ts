@@ -27,6 +27,8 @@ export interface ClaudeOAuthTokens {
   refreshToken?: string;
   /** Unix milliseconds; absent when unknown, as for a pasted token. */
   expiresAt?: number;
+  /** Unix milliseconds. Refreshing never moves it; after it the account must sign in again. */
+  refreshExpiresAt?: number;
   scopes: string[];
 }
 
@@ -143,10 +145,15 @@ function text(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
-function parseTokens(value: unknown, previousRefreshToken?: string): ClaudeOAuthTokens {
+function parseTokens(value: unknown, previous?: ClaudeOAuthTokens): ClaudeOAuthTokens {
   if (!isRecord(value)) throw new ClaudeOAuthError("Token response is malformed");
   const accessToken = text(value.access_token);
-  const refreshToken = text(value.refresh_token) ?? previousRefreshToken;
+  const refreshToken = text(value.refresh_token) ?? previous?.refreshToken;
+  const refreshExpiresIn = value.refresh_token_expires_in;
+  const refreshExpiresAt =
+    typeof refreshExpiresIn === "number" && refreshExpiresIn > 0
+      ? Date.now() + refreshExpiresIn * 1000
+      : previous?.refreshExpiresAt;
   const expiresIn = value.expires_in;
   if (!accessToken || typeof expiresIn !== "number" || expiresIn <= 0) {
     throw new ClaudeOAuthError("Token response is malformed");
@@ -156,6 +163,7 @@ function parseTokens(value: unknown, previousRefreshToken?: string): ClaudeOAuth
     accessToken,
     ...(refreshToken ? { refreshToken } : {}),
     expiresAt: Date.now() + expiresIn * 1000,
+    ...(refreshToken && refreshExpiresAt !== undefined ? { refreshExpiresAt } : {}),
     scopes,
   };
 }
@@ -229,7 +237,7 @@ export async function refreshClaudeTokens(
     },
     "Token refresh",
   );
-  const refreshed = parseTokens(value, tokens.refreshToken);
+  const refreshed = parseTokens(value, tokens);
   return refreshed.scopes.length ? refreshed : { ...refreshed, scopes: tokens.scopes };
 }
 

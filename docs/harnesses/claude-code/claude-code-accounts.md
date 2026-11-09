@@ -12,12 +12,31 @@ codexhost 可以保存多个 Claude 订阅登录，让 Claude Code Thread 在其
 
 所以 Adapter 不碰原生凭据，而是自己保存登录，启动 `claude` 时用 `CLAUDE_CODE_OAUTH_TOKEN` 环境变量注入当前账号的 access token。环境变量的优先级高于 Claude Code 的所有存储登录（`claude auth status` 显示 `authMethod: "oauth_token"`），macOS 和 Windows 行为一致。注入时同时移除继承来的 `ANTHROPIC_API_KEY` 与 `ANTHROPIC_AUTH_TOKEN`，避免它们抢先生效。
 
+## 本机 Claude Code 登录
+
+账号列表始终有一行“本机 Claude Code 登录”，自动读取这台电脑上 Claude Code 当前登录的账号，选中它即不注入任何 token、由 Claude Code 使用自己的登录：
+
+- 身份读自 Claude Code 的全局配置 `oauthAccount`（`$CLAUDE_CONFIG_DIR/.claude.json` 或 `~/.claude.json`，存在旧版 `~/.claude/.config.json` 时优先），按文件修改时间缓存。
+- token 只读：macOS 用与 Claude Code 相同的 `security find-generic-password -a $USER -s "Claude Code-credentials[-<CLAUDE_CONFIG_DIR 哈希>]"`，不会弹钥匙串授权；其他平台读 `.credentials.json`。Windows 上 Claude Code 可能把 token 放在凭据管理器里，此时只显示身份、不显示额度。token 未过期时用它读一次额度（60 秒内复用），过期就不读；**从不刷新**，因为刷新会轮换 Claude Code 自己的 refresh token，把 Claude Code 登出。
+- 当前使用本机登录时，原生会话推送的 `rate_limit_event` 也写入这一行的额度，达到阈值同样会自动切到保存的账号。
+- 本机登录模式的会话键是 `native:<accountUuid>:<organizationUuid>`：其他工具切换了 Claude Code 自己的登录后，空闲 Thread 在下一轮按新账号 `resume`，正在运行的不受影响。
+- 与某个保存账号是同一账号时标注“已同时保存为账号”。本机有 Claude Code 登录时，添加或导入账号不会改变正在使用的账号；只有本机没有登录时，第一个保存的账号自动启用。
+
+## 导入
+
+“导入账号”选择一个 JSON 文件（不超过 3 MB），Adapter 识别其中所有带 Claude Code 凭据结构的记录：账号管理工具导出（如 Cockpit Tools 的 `claude_credentials_raw.claudeAiOauth`，旁边的 `email`、`account_uuid`、`organization_uuid`、`plan_type` 与 `claude_config_raw.oauthAccount` 提供身份）、Claude Code 的 `.credentials.json`（`claudeAiOauth`），或 `{ "accessToken": "sk-ant-oat…" }`。没有邮箱且 token 仍有效时，用资料接口补上账号名。
+
+- 导入的是普通登录 token：access token 约 8 小时，refresh token 有固定期限（导出里的 `refreshTokenExpiresAt`，刷新不会延长）。设置页把这个期限显示为账号的到期时间，少于 30 天时提示重新登录；重新登录会换成一年期 token。
+- 导入后 codexhost 会刷新这些 token，refresh token 随之轮换，导出它们的工具里那份就会失效；同一账号不要在两边同时使用。
+- 已保存且可用的账号不会被导入覆盖；已失效的副本也不会覆盖任何账号。结果按“新增、更新（替换了已失效的保存账号）、已存在、已失效”汇总显示。
+- 控制台转发 Host 请求的请求体上限为此放宽到 4 MiB（其余控制台接口仍是 16 KiB，且都在请求头与来源校验之后才读取）。
+
 ## 登录与保存
 
 - 添加账号走与 `claude setup-token` 相同的长效登录：OAuth PKCE 授权（`claude.com/cai/oauth/authorize`），scope 只申请 `user:inference user:profile`，换 token（`platform.claude.com/v1/oauth/token`）时带 `expires_in: 31536000`，得到一年有效、无需刷新的 access token。token 端点只对部分 scope 接受自定义有效期（`user:mcp_servers` 会被拒绝），所以不申请 Claude Code 交互登录的完整 scope；`user:profile` 保留资料与额度接口。通过 `CLAUDE_CODE_OAUTH_TOKEN` 传入时 Claude Code 本来就只按推理权限使用它。
 - 普通登录的 refresh token 有约 29 天的绝对期限，刷新不能延长，所以长效 token 比“定期刷新”更省事：一年内不需要重新登录，也不存在两边轮换 refresh token 互相顶掉的问题。
 - 换 token 的响应自带账号 `email_address` / `uuid` 与组织 `uuid`；资料接口再补上订阅类型，资料接口失败时只用前者。同一账号（`account.uuid` + `organization.uuid`）重复登录只更新已有记录，不新增条目。第一个账号自动成为当前账号。
-- Adapter 在 `127.0.0.1` 与 `::1` 的同一随机端口上监听 `/callback`，回调成功后跳转到官方登录成功页。浏览器在另一台设备上时，可以把 `code#state` 或完整跳转链接粘贴回设置页；`state` 不匹配会拒绝。
+- 与 Claude Code 一样，一次登录同时给出两个链接，共用同一对 PKCE 与 `state`：“打开登录页”走 `http://localhost:<随机端口>/callback`，Adapter 在 `127.0.0.1` 与 `::1` 的同一端口上监听，回调成功后跳转官方成功页；“复制登录链接”走官方授权码页（`platform.claude.com/oauth/code/callback`），可在任意浏览器或其他设备打开，登录后把页面上的 `code#state` 粘贴回设置页。粘贴的若是本机回调链接，则按回调地址换 token；`state` 不匹配会拒绝。复制失败时显示链接供手动复制。登录面板每次登录只构建一次，轮询不会清掉正在粘贴的内容。
 - 同一个输入框也接受已有的 `sk-ant-oat…` token（例如 `claude setup-token` 的输出，`token.add` 动作）。这类 token 只有推理权限，读不到资料和额度：名称显示为 `Claude (…末四位)`，有效期未知，额度在它作为当前账号运行后由 `rate_limit_event` 写入，资料或额度接口返回 403 不算错误。
 - 所有平台同一种存储：元数据在 `<CODEXHOST_DATA_DIR 或 ~/.codexhost>/claude-accounts/profiles.json`，token 在同目录 `secrets/<profileId>.json`。macOS/Linux 为 0600；Windows 继承用户目录 ACL，与 Claude Code 自己在 Windows 上的 `.credentials.json` 保护方式一致。写入用临时文件加替换，Windows 上替换遇到 `EPERM`/`EBUSY`/`EACCES` 短暂重试。整个 `claude-accounts` 目录可以直接拷到另一台机器使用。
 - 长效 token 不刷新：过期或被 Claude 拒绝（401）时账号标记为“登录已失效”，当前账号会自动换到下一个可用账号。少于 30 天到期时设置页提示重新登录。仍带 refresh token 的旧记录照常在到期前 30 分钟刷新。
@@ -37,9 +56,9 @@ codexhost 可以保存多个 Claude 订阅登录，让 Claude Code Thread 在其
 
 ## 协议
 
-Renderer 经 `codexhost/harness/account-profiles`（`shared-contracts` 的 `harnessAccountProfilesParamsSchema`）发送 `list`、`login.start`、`login.complete`、`login.cancel`、`token.add`、`activate`、`remove`、`rename`、`autoSwitch.set`，Host 按 `harnessId` 路由到 Adapter 公开的 `accountProfiles` 能力，返回完整状态。没有这个能力的 Harness 不显示该区块。Desktop 设置页经 `versioned-renderer-adapter.ts` 的设置客户端转发，新增客户端方法时那里也要转发，否则 Desktop 中请求不会发出、区块保持隐藏。`activate` 传 `null` 表示回到 Claude Code 自身登录。
+Renderer 经 `codexhost/harness/account-profiles`（`shared-contracts` 的 `harnessAccountProfilesParamsSchema`）发送 `list`、`login.start`、`login.complete`、`login.cancel`、`import`、`token.add`、`activate`、`remove`、`rename`、`autoSwitch.set`，Host 按 `harnessId` 路由到 Adapter 公开的 `accountProfiles` 能力，返回完整状态（含 `native`；`import` 的回复另带 `importSummary`）。没有这个能力的 Harness 不显示该区块。Desktop 设置页经 `versioned-renderer-adapter.ts` 的设置客户端转发，新增客户端方法时那里也要转发，否则 Desktop 中请求不会发出、区块保持隐藏。`activate` 传 `null` 表示回到 Claude Code 自身登录。
 
 ## 验证
 
-- 单元测试：`packages/adapters/claude-code/test/account-profiles.test.ts`（一年期 token 请求与 scope、去重、切换、长效 token 不刷新、过期或被拒后自动换号、旧 refresh token 刷新、粘贴 setup-token、阈值切换、删除当前账号、文件存储）与 `claude-code-adapter.test.ts` 的 “saved Claude sign-ins”（注入环境、空闲时按新账号 resume、plan limit 转发）。
+- 单元测试：`packages/adapters/claude-code/test/account-profiles.test.ts`（一年期 token 请求与 scope、去重、切换、长效 token 不刷新、过期或被拒后自动换号、旧 refresh token 刷新、粘贴 setup-token、阈值切换、删除当前账号、文件存储、复制链接走授权码页、导入导出文件与 `.credentials.json`、本机登录只读且不刷新、本机账号切换改变会话键并可自动切到保存账号）与 `claude-code-adapter.test.ts` 的 “saved Claude sign-ins”（注入环境、空闲时按新账号 resume、plan limit 转发）。
 - 2026-11-09 在 Claude Code 2.1.317 上确认 `CLAUDE_CODE_OAUTH_TOKEN` 优先于钥匙串登录，并从其 `setup-token` 实现确认 scope 与 `expires_in` 参数。`user:inference user:profile` 可获一年期 token 的结论来自第三方实测（2026-09），本项目尚未用真实账号验证；Windows 实机尚未验证。
