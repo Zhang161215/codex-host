@@ -760,6 +760,7 @@
 }
 .settings-claude-accounts__login[hidden],
 .settings-claude-accounts__footer[hidden],
+.settings-claude-accounts__threads[hidden],
 .settings-claude-accounts__notice[hidden] {
   display: none;
 }
@@ -826,10 +827,14 @@
   border-radius: 6px;
 }
 .settings-claude-accounts__help,
+.settings-claude-accounts__threads,
 .settings-claude-accounts__notice {
   margin: 0;
   color: var(--settings-muted);
   font-size: 11px;
+}
+.settings-claude-accounts__threads {
+  padding: 8px 2px 0;
 }
 .settings-claude-accounts__notice {
   padding: 8px 2px 0;

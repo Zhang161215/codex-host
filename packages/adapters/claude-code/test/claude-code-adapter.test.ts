@@ -26,6 +26,7 @@ import {
 } from "../src/permission-modes.js";
 import { ClaudeSdkTransport } from "../src/sdk-transport.js";
 import type { ClaudeAccountProfiles } from "../src/account-profiles/manager.js";
+import type { ClaudeThreadSignIn } from "../src/account-profiles/threads.js";
 import {
   ClaudeSteerMissedTurnError,
   type ClaudeAdapterDependencies,
@@ -8136,20 +8137,31 @@ function defined<T>(value: T | null | undefined): T {
 describe("saved Claude sign-ins", () => {
   function signInStub() {
     const signIn = { key: "first" };
+    let threads: (() => Iterable<ClaudeThreadSignIn>) | null = null;
     const profiles = {
       spawnEnvironment: vi.fn(async () => ({
         key: signIn.key,
+        profileId: `profile-${signIn.key}`,
         apply: (environment: NodeJS.ProcessEnv) => ({
           ...environment,
           CLAUDE_CODE_OAUTH_TOKEN: `token-${signIn.key}`,
         }),
       })),
       observePlanLimit: vi.fn(),
+      reportAuthenticationFailure: vi.fn(),
+      attachThreads: vi.fn((source: () => Iterable<ClaudeThreadSignIn>) => {
+        threads = source;
+      }),
       activeAccountSnapshot: vi.fn(async () => undefined),
       handle: vi.fn(),
       close: vi.fn(),
     };
-    return { signIn, profiles: profiles as unknown as ClaudeAccountProfiles, stub: profiles };
+    return {
+      signIn,
+      profiles: profiles as unknown as ClaudeAccountProfiles,
+      stub: profiles,
+      threads: () => [...defined(threads)()],
+    };
   }
 
   it("starts the native process under the active saved sign-in", async () => {
@@ -8218,8 +8230,95 @@ describe("saved Claude sign-ins", () => {
       await session.execute(textTurn("turn-1"));
       await vi.waitFor(() => expect(transports[0]?.turns).toHaveLength(1));
       defined(transports[0]).planLimit({ fiveHour: { utilizationPercent: 97 } });
-      expect(stub.observePlanLimit).toHaveBeenCalledWith({ fiveHour: { utilizationPercent: 97 } });
+      expect(stub.observePlanLimit).toHaveBeenCalledWith(
+        { fiveHour: { utilizationPercent: 97 } },
+        "profile-first",
+      );
       defined(transports[0]).finish({ status: "succeeded" });
+    } finally {
+      await adapter.close();
+    }
+  });
+
+  it("lets a running Turn finish on its sign-in and switches the Thread after it", async () => {
+    const { signIn, profiles, threads } = signInStub();
+    const { adapter, dependencies, transports } = fixture({ accountProfiles: profiles });
+    try {
+      const session = await openSession(adapter);
+      await expect(session.execute(textTurn("turn-1"))).resolves.toMatchObject({ ok: true });
+      await vi.waitFor(() => expect(transports[0]?.turns).toHaveLength(1));
+      expect(threads()).toEqual([{ profileId: "profile-first", key: "first", idle: false }]);
+
+      // The switch lands mid-Turn: the running process is neither closed nor replaced.
+      signIn.key = "second";
+      expect(defined(transports[0]).close).not.toHaveBeenCalled();
+      expect(transports).toHaveLength(1);
+      defined(transports[0]).finish({ status: "succeeded" });
+      await vi.waitFor(() =>
+        expect(threads()).toEqual([{ profileId: "profile-first", key: "first", idle: true }]),
+      );
+
+      await vi.waitFor(async () =>
+        expect(await session.execute(textTurn("turn-2"))).toMatchObject({ ok: true }),
+      );
+      await vi.waitFor(() => expect(transports[1]?.turns).toHaveLength(1));
+      expect(defined(transports[0]).close).toHaveBeenCalled();
+      expect(dependencies.createTransport).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          openMode: "resume",
+          environment: expect.objectContaining({ CLAUDE_CODE_OAUTH_TOKEN: "token-second" }),
+        }),
+      );
+      expect(threads()).toEqual([{ profileId: "profile-second", key: "second", idle: false }]);
+      defined(transports[1]).finish({ status: "succeeded" });
+    } finally {
+      await adapter.close();
+    }
+  });
+
+  it("reports quota to the account each Thread's process runs under", async () => {
+    const { signIn, profiles, stub } = signInStub();
+    const { adapter, transports } = fixture({ accountProfiles: profiles });
+    try {
+      const first = await openSession(adapter);
+      await first.execute(textTurn("turn-1"));
+      await vi.waitFor(() => expect(transports[0]?.turns).toHaveLength(1));
+      signIn.key = "second";
+      const second = await openSession(adapter);
+      await second.execute(textTurn("turn-2"));
+      await vi.waitFor(() => expect(transports[1]?.turns).toHaveLength(1));
+
+      // The first Thread is still mid-Turn on the earlier account.
+      defined(transports[0]).planLimit({ fiveHour: { utilizationPercent: 99 }, rejected: true });
+      defined(transports[1]).planLimit({ fiveHour: { utilizationPercent: 12 } });
+      expect(stub.observePlanLimit).toHaveBeenNthCalledWith(
+        1,
+        { fiveHour: { utilizationPercent: 99 }, rejected: true },
+        "profile-first",
+      );
+      expect(stub.observePlanLimit).toHaveBeenNthCalledWith(
+        2,
+        { fiveHour: { utilizationPercent: 12 } },
+        "profile-second",
+      );
+      defined(transports[0]).finish({ status: "succeeded" });
+      defined(transports[1]).finish({ status: "succeeded" });
+    } finally {
+      await adapter.close();
+    }
+  });
+
+  it("tells the saved sign-ins when Claude refuses a Turn's authentication", async () => {
+    const { profiles, stub } = signInStub();
+    const { adapter, transports } = fixture({ accountProfiles: profiles });
+    try {
+      const session = await openSession(adapter);
+      await session.execute(textTurn("turn-1"));
+      await vi.waitFor(() => expect(transports[0]?.turns).toHaveLength(1));
+      defined(transports[0]).finish({ status: "failed", kind: "authentication" });
+      await vi.waitFor(() =>
+        expect(stub.reportAuthenticationFailure).toHaveBeenCalledWith("profile-first"),
+      );
     } finally {
       await adapter.close();
     }

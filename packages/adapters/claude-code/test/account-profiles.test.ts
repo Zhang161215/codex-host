@@ -4,6 +4,7 @@ import path from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import type { ClaudeThreadSignIn } from "../src/account-profiles/threads.js";
 import { ClaudeAccountProfiles } from "../src/account-profiles/manager.js";
 import { parsePastedAuthorization } from "../src/account-profiles/login.js";
 import { CLAUDE_OAUTH, type ClaudeOAuthTokens } from "../src/account-profiles/oauth.js";
@@ -372,6 +373,107 @@ describe("Claude account profiles", () => {
       toProfileId: bobId,
       reason: "auto",
     });
+  });
+
+  it("a saved sign-in owns the process: no inherited or settings routing can redirect it", async () => {
+    const { profiles, signIn } = await setup({ "code-a": alice });
+    await signIn("code-a");
+    const spawn = defined(await profiles.spawnEnvironment());
+    expect(spawn.profileId).toBe((await profiles.state()).activeProfileId);
+    expect(
+      spawn.apply({
+        PATH: "/bin",
+        ANTHROPIC_BASE_URL: "https://relay.example",
+        ANTHROPIC_AUTH_TOKEN: "relay-token",
+        // Windows environment names are case-insensitive.
+        anthropic_api_key: "sk-ant-api",
+        CLAUDE_CODE_USE_BEDROCK: "1",
+        CLAUDE_CODE_OAUTH_TOKEN: "another-account",
+        CLAUDE_CODE_SUBSCRIPTION_TYPE: "pro",
+      }),
+    ).toEqual({
+      PATH: "/bin",
+      CLAUDE_CODE_OAUTH_TOKEN: expect.stringMatching(/^access-alice-/u),
+      // Claude Code then ignores provider and credential settings from settings files too.
+      CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST: "1",
+      CLAUDE_CODE_SUBSCRIPTION_TYPE: "max",
+      CLAUDE_CODE_ORGANIZATION_UUID: "org-alice",
+    });
+  });
+
+  it("quota from a Thread still on an earlier account goes to that account only", async () => {
+    const { profiles, signIn } = await setup({ "code-a": alice, "code-b": bob });
+    await signIn("code-a");
+    const state = await signIn("code-b");
+    const aliceId = defined(state.activeProfileId);
+    const bobId = defined(state.profiles.find((item) => item.email === bob.email)).profileId;
+    await profiles.handle({ action: "activate", profileId: bobId });
+    profiles.observePlanLimit({ fiveHour: { utilizationPercent: 100 }, rejected: true }, aliceId);
+    await vi.waitFor(async () =>
+      expect(
+        (await profiles.state()).profiles.find((p) => p.profileId === aliceId)?.fiveHour,
+      ).toMatchObject({ usedPercent: 100 }),
+    );
+    const after = await profiles.state();
+    expect(after.activeProfileId).toBe(bobId);
+    expect(after.profiles.find((p) => p.profileId === bobId)?.fiveHour).toMatchObject({
+      usedPercent: 5,
+    });
+  });
+
+  it("a refused request switches at once, below the threshold and inside the cooldown", async () => {
+    const erin: FakeAccount = {
+      uuid: "erin",
+      email: "erin@example.com",
+      fiveHour: 50,
+      sevenDay: 20,
+    };
+    const { profiles, signIn } = await setup({ "code-a": alice, "code-b": bob, "code-e": erin });
+    await signIn("code-a");
+    await signIn("code-b");
+    const state = await signIn("code-e");
+    const bobId = defined(state.profiles.find((item) => item.email === bob.email)).profileId;
+    const erinId = defined(state.profiles.find((item) => item.email === erin.email)).profileId;
+    profiles.observePlanLimit({ fiveHour: { utilizationPercent: 100 } });
+    await vi.waitFor(async () => expect((await profiles.state()).activeProfileId).toBe(bobId));
+    profiles.observePlanLimit({ fiveHour: { utilizationPercent: 30 }, rejected: true }, bobId);
+    await vi.waitFor(async () => expect((await profiles.state()).activeProfileId).toBe(erinId));
+  });
+
+  it("reports where open Threads stand after a switch", async () => {
+    const { profiles, signIn } = await setup({ "code-a": alice, "code-b": bob });
+    await signIn("code-a");
+    const state = await signIn("code-b");
+    const aliceId = defined(state.activeProfileId);
+    const bobId = defined(state.profiles.find((item) => item.email === bob.email)).profileId;
+    expect(state.threads).toBeUndefined();
+    const threads: ClaudeThreadSignIn[] = [
+      { profileId: aliceId, key: `${aliceId}:a`, idle: true },
+      { profileId: aliceId, key: `${aliceId}:b`, idle: false },
+      { profileId: null, key: "native::", idle: true },
+    ];
+    profiles.attachThreads(() => threads);
+    expect((await profiles.state()).threads).toEqual({ current: 2, nextMessage: 1, afterTurn: 0 });
+    await profiles.handle({ action: "activate", profileId: bobId });
+    expect((await profiles.state()).threads).toEqual({ current: 0, nextMessage: 2, afterTurn: 1 });
+    await profiles.handle({ action: "activate", profileId: null });
+    expect((await profiles.state()).threads).toEqual({ current: 1, nextMessage: 1, afterTurn: 1 });
+  });
+
+  it("a Turn refused authentication marks a revoked sign-in expired; the next Turn moves on", async () => {
+    const { profiles, anthropic, signIn } = await setup({ "code-a": alice, "code-b": bob });
+    await signIn("code-a");
+    await signIn("code-b");
+    const aliceId = defined((await profiles.state()).activeProfileId);
+    anthropic.revoke("alice");
+    profiles.reportAuthenticationFailure(aliceId);
+    await vi.waitFor(async () =>
+      expect((await profiles.state()).profiles.find((p) => p.profileId === aliceId)?.status).toBe(
+        "expired",
+      ),
+    );
+    const spawn = await profiles.spawnEnvironment();
+    expect(defined(spawn).apply({}).CLAUDE_CODE_OAUTH_TOKEN).toMatch(/^access-bob-/u);
   });
 
   it("does not switch automatically when disabled", async () => {

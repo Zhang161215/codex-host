@@ -52,6 +52,12 @@ export const claudeAccountEnglish = {
   loginFailed: "Sign-in failed: {error}",
   applyNote:
     "A switch applies to each conversation from its next message; running work keeps its account.",
+  threadsAll: "All {count} open Claude conversations use the current account.",
+  threadsDone: "{parts}.",
+  threadsCurrent: "{count} on the current account",
+  threadsNext: "{count} idle, switching at the next message",
+  threadsAfter: "{count} running, switching once the current reply ends",
+  threadsSeparator: "; ",
   failed: "The account operation failed: {error}",
 };
 export type ClaudeAccountMessages = typeof claudeAccountEnglish;
@@ -106,5 +112,11 @@ export const claudeAccountChinese: ClaudeAccountMessages = {
   importExpired: "{count} 个已失效，需要重新登录",
   loginFailed: "登录失败：{error}",
   applyNote: "切换后，每个对话从下一条消息开始使用新账号；正在运行的任务保持原账号。",
+  threadsAll: "打开的 {count} 个 Claude 对话都在用当前账号。",
+  threadsDone: "{parts}。",
+  threadsCurrent: "{count} 个对话在用当前账号",
+  threadsNext: "{count} 个空闲对话会在下一条消息时切换",
+  threadsAfter: "{count} 个对话正在回复，本轮结束后切换",
+  threadsSeparator: "；",
   failed: "账号操作失败：{error}",
 };

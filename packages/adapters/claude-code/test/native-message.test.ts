@@ -1283,6 +1283,31 @@ describe("Claude native Turn interpretation", () => {
     });
   });
 
+  it("reads a refused request as the named window used up", () => {
+    expect(
+      parseClaudePlanLimitEvent({
+        type: "rate_limit_event",
+        rate_limit_info: {
+          status: "rejected",
+          resetsAt: 1_787_674_200,
+          rateLimitType: "five_hour",
+          unifiedWindows: { seven_day: { utilization: 0.4, resetsAt: 1_787_940_000 } },
+        },
+      }),
+    ).toEqual({
+      fiveHour: { utilizationPercent: 100, resetsAtUnix: 1_787_674_200 },
+      sevenDay: { utilizationPercent: 40, resetsAtUnix: 1_787_940_000 },
+      rejected: true,
+    });
+    // A per-model weekly limit has no plan window of its own, but is still a refusal.
+    expect(
+      parseClaudePlanLimitEvent({
+        type: "rate_limit_event",
+        rate_limit_info: { status: "rejected", rateLimitType: "seven_day_opus" },
+      }),
+    ).toEqual({ rejected: true });
+  });
+
   it("parses a single unifiedWindows entry when only one window is present", () => {
     expect(
       parseClaudePlanLimitEvent({

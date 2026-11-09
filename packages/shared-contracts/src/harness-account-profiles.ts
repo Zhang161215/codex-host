@@ -91,6 +91,22 @@ export const harnessAccountNativeSchema = z
   .strict();
 export type HarnessAccountNative = z.infer<typeof harnessAccountNativeSchema>;
 
+/**
+ * Where the Harness's open Threads stand after a switch. A running native process keeps the
+ * sign-in it started with, so it changes accounts at a Turn boundary rather than mid-Turn.
+ */
+export const harnessAccountThreadsSchema = z
+  .object({
+    /** Threads whose native process already runs under the active sign-in. */
+    current: z.number().int().min(0),
+    /** Idle Threads still under an earlier sign-in; their next message restarts them. */
+    nextMessage: z.number().int().min(0),
+    /** Threads running a Turn under an earlier sign-in; they change after that Turn. */
+    afterTurn: z.number().int().min(0),
+  })
+  .strict();
+export type HarnessAccountThreads = z.infer<typeof harnessAccountThreadsSchema>;
+
 export const harnessAccountImportSummarySchema = z
   .object({
     added: z.number().int().min(0),
@@ -115,6 +131,8 @@ export const harnessAccountProfilesStateSchema = z
     lastSwitch: harnessAccountSwitchSchema.nullable(),
     /** Null when no native sign-in was found; absent when the Harness cannot read it. */
     native: harnessAccountNativeSchema.nullable().optional(),
+    /** Absent when the Harness does not report its open Threads. */
+    threads: harnessAccountThreadsSchema.optional(),
     /** Present only in the reply to an `import` request. */
     importSummary: harnessAccountImportSummarySchema.optional(),
   })

@@ -233,6 +233,8 @@ export interface ClaudePlanLimitWindow {
 export interface ClaudePlanLimitEvent {
   fiveHour?: ClaudePlanLimitWindow;
   sevenDay?: ClaudePlanLimitWindow;
+  /** Claude refused a request because a limit was reached (`rate_limit_info.status`). */
+  rejected?: boolean;
 }
 
 export interface ClaudeIdleTurnHandler {

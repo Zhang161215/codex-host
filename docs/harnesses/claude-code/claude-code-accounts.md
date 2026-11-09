@@ -10,7 +10,16 @@ codexhost 可以保存多个 Claude 订阅登录，让 Claude Code Thread 在其
 - Claude Code 自己会在 401 时回退到磁盘上的旧 token，并缓存钥匙串读取约 30 秒。
 - Windows 上 Claude Code 在 `tengu_windows_credman` 开启时改用凭据管理器，替换 `.credentials.json` 不一定生效。
 
-所以 Adapter 不碰原生凭据，而是自己保存登录，启动 `claude` 时用 `CLAUDE_CODE_OAUTH_TOKEN` 环境变量注入当前账号的 access token。环境变量的优先级高于 Claude Code 的所有存储登录（`claude auth status` 显示 `authMethod: "oauth_token"`），macOS 和 Windows 行为一致。注入时同时移除继承来的 `ANTHROPIC_API_KEY` 与 `ANTHROPIC_AUTH_TOKEN`，避免它们抢先生效。
+所以 Adapter 不碰原生凭据，而是自己保存登录，启动 `claude` 时用 `CLAUDE_CODE_OAUTH_TOKEN` 环境变量注入当前账号的 access token。环境变量的优先级高于 Claude Code 的所有存储登录（`claude auth status` 显示 `authMethod: "oauth_token"`），macOS 和 Windows 行为一致。
+
+## 选中保存的账号时，进程只走这个账号
+
+账号由 codexhost 决定，外部配置不能把进程带到别处（`account-profiles/spawn-environment.ts`）：
+
+- Claude Code 的认证优先级里 `ANTHROPIC_AUTH_TOKEN` 高于 `CLAUDE_CODE_OAUTH_TOKEN`，`ANTHROPIC_BASE_URL` 会把带 OAuth token 的请求发到别的地址。启动环境里继承来的这类变量全部移除（不区分大小写，Windows 环境变量名不区分大小写）：`ANTHROPIC_API_KEY`、`ANTHROPIC_AUTH_TOKEN`、`ANTHROPIC_BASE_URL`、`ANTHROPIC_CUSTOM_HEADERS`、`ANTHROPIC_UNIX_SOCKET`、各类 token 文件描述符、`CLAUDE_CODE_USE_*` 第三方云开关，以及旧的订阅类型 / 组织变量。
+- `settings.json` 的 `env` 是 Claude Code 进程启动后自己读进来的，删启动环境挡不住。注入同时设置 `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1`：Claude Code（2.1.317 源码确认）随后忽略所有来自设置文件的供应商、端点、凭据与模型路由变量（`ANTHROPIC_BASE_URL`、`ANTHROPIC_AUTH_TOKEN`、`ANTHROPIC_API_KEY`、`CLAUDE_CODE_USE_*`、`ANTHROPIC_MODEL` 等），也不再执行设置里的 `apiKeyHelper`。其余设置（权限、hooks、MCP、代理等）照常生效。
+- 环境变量 token 不带账号资料，同时传 `CLAUDE_CODE_SUBSCRIPTION_TYPE`（`pro` / `max` / `team` / `enterprise`）与 `CLAUDE_CODE_ORGANIZATION_UUID`，Claude Code 才按该账号的套餐决定默认模型与可用模型。
+- 选中“本机 Claude Code 登录”时不做任何改动，进程按 Claude Code 自己的配置运行。
 
 ## 本机 Claude Code 登录
 
@@ -43,22 +52,26 @@ codexhost 可以保存多个 Claude 订阅登录，让 Claude Code Thread 在其
 
 ## 切换生效时机
 
-- 每次启动或复用会话进程前，Adapter 计算当前登录的键（profileId + token 摘要）。键变化时，若该 Thread 处于空闲（没有进行中的 Turn、自主 Turn、取消、配置变更或后台命令），关闭旧进程并以 `resume` 重新打开，同一会话历史在新账号下继续；不空闲时保留旧进程，正在运行的任务不受影响，下一次空闲时再切换。
+- 每次启动或复用会话进程前，Adapter 计算当前登录的键（profileId + token 摘要）。键变化时，若该 Thread 处于空闲（没有进行中的 Turn、自主 Turn、取消、配置变更或后台命令），关闭旧进程并以 `resume` 重新打开，同一会话历史在新账号下继续；不空闲时保留旧进程，正在运行的任务不受影响，下一次空闲时再切换。切换不需要重启 codexhost。
+- 设置页账号区显示打开的 Claude Thread 各自所处位置（状态里的 `threads`）：已在用当前账号、空闲且下一条消息时切换、正在回复且本轮结束后切换。区块打开时每 5 秒重读一次；正在编辑、下拉框展开或焦点在区块内时不重绘。
 - 模型列表探测进程同样使用当前账号的环境。
 - 设置页“账号”里的 Claude Code 额度显示当前保存账号的用量；使用原生登录时仍读 Claude Code 自己的额度。
 
 ## 自动切换
 
 - 默认开启，阈值 95%，可选 80–100%。阈值作用于 5 小时与 7 天两个窗口中较高的一个。
-- 触发来源是 Claude Code 流里的 `rate_limit_event`：当前账号用量写回该账号，达到阈值且距上次自动切换超过 2 分钟时，刷新其他账号的额度，选两窗口最高用量最低、且低于阈值的可用账号切过去。没有满足条件的账号时保持不变。
-- 当前账号登录失效（过期、被拒绝或刷新失败）时同样触发自动切换。
+- 触发来源是 Claude Code 流里的 `rate_limit_event`：用量写回发出事件的那个进程所用的账号（切换后仍在跑完本轮的 Thread 报的是旧账号，不会算到新账号头上，也不会触发切换）；只有当前账号达到阈值且距上次自动切换超过 2 分钟时，才刷新其他账号的额度，选两窗口最高用量最低、且低于阈值的可用账号切过去。没有满足条件的账号时保持不变。
+- `rate_limit_info.status` 为 `rejected` 表示 Claude 已拒绝请求：对应窗口记为 100%，并立即切换，不受阈值与 2 分钟冷却限制（按模型的周限额如 `seven_day_opus` 被拒同样切换）。被拒的那一轮会以失败结束，下一条消息在新账号下继续。
+- 每个账号的 5 小时 / 7 天额度只推给在同一账号下运行的 Thread，不同账号的 Thread 不共享额度显示。
+- 当前账号登录失效（过期、被拒绝或刷新失败）时同样触发自动切换。Turn 因认证失败结束时，Adapter 立即复查该账号：确认被拒（401）即标记失效，下一条消息换到其他账号。
 - 额度每 60 秒内复用缓存，设置页“刷新额度”强制刷新；额度数据来自 `GET api.anthropic.com/api/oauth/usage`，不是实时推送。
 
 ## 协议
 
-Renderer 经 `codexhost/harness/account-profiles`（`shared-contracts` 的 `harnessAccountProfilesParamsSchema`）发送 `list`、`login.start`、`login.complete`、`login.cancel`、`import`、`token.add`、`activate`、`remove`、`rename`、`autoSwitch.set`，Host 按 `harnessId` 路由到 Adapter 公开的 `accountProfiles` 能力，返回完整状态（含 `native`；`import` 的回复另带 `importSummary`）。没有这个能力的 Harness 不显示该区块。Desktop 设置页经 `versioned-renderer-adapter.ts` 的设置客户端转发，新增客户端方法时那里也要转发，否则 Desktop 中请求不会发出、区块保持隐藏。`activate` 传 `null` 表示回到 Claude Code 自身登录。
+Renderer 经 `codexhost/harness/account-profiles`（`shared-contracts` 的 `harnessAccountProfilesParamsSchema`）发送 `list`、`login.start`、`login.complete`、`login.cancel`、`import`、`token.add`、`activate`、`remove`、`rename`、`autoSwitch.set`，Host 按 `harnessId` 路由到 Adapter 公开的 `accountProfiles` 能力，返回完整状态（含 `native` 与 `threads`；`import` 的回复另带 `importSummary`）。没有这个能力的 Harness 不显示该区块。Desktop 设置页经 `versioned-renderer-adapter.ts` 的设置客户端转发，新增客户端方法时那里也要转发，否则 Desktop 中请求不会发出、区块保持隐藏。`activate` 传 `null` 表示回到 Claude Code 自身登录。
 
 ## 验证
 
-- 单元测试：`packages/adapters/claude-code/test/account-profiles.test.ts`（一年期 token 请求与 scope、去重、切换、长效 token 不刷新、过期或被拒后自动换号、旧 refresh token 刷新、粘贴 setup-token、阈值切换、删除当前账号、文件存储、复制链接走授权码页、导入导出文件与 `.credentials.json`、本机登录只读且不刷新、本机账号切换改变会话键并可自动切到保存账号）与 `claude-code-adapter.test.ts` 的 “saved Claude sign-ins”（注入环境、空闲时按新账号 resume、plan limit 转发）。
+- 单元测试：`packages/adapters/claude-code/test/account-profiles.test.ts`（一年期 token 请求与 scope、去重、切换、长效 token 不刷新、过期或被拒后自动换号、旧 refresh token 刷新、粘贴 setup-token、阈值切换、删除当前账号、文件存储、复制链接走授权码页、导入导出文件与 `.credentials.json`、本机登录只读且不刷新、本机账号切换改变会话键并可自动切到保存账号）、外部路由变量全部被挡住、旧账号额度不记到新账号、`rejected` 立即切换、Thread 状态统计、认证失败后换号）、`native-message.test.ts`（`rejected` 解析）与 `claude-code-adapter.test.ts` 的 “saved Claude sign-ins”（注入环境、空闲时按新账号 resume、运行中的 Turn 跑完再切、额度按进程所用账号上报、认证失败上报）。
+- 2026-11-09 从 Claude Code 2.1.317 源码确认认证优先级（`ANTHROPIC_AUTH_TOKEN` > `CLAUDE_CODE_OAUTH_TOKEN` > 存储登录）、`CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST` 忽略设置文件中的供应商变量与 `apiKeyHelper`，以及 `rate_limit_info.status` 的 `rejected`。
 - 2026-11-09 在 Claude Code 2.1.317 上确认 `CLAUDE_CODE_OAUTH_TOKEN` 优先于钥匙串登录，并从其 `setup-token` 实现确认 scope 与 `expires_in` 参数。`user:inference user:profile` 可获一年期 token 的结论来自第三方实测（2026-09），本项目尚未用真实账号验证；Windows 实机尚未验证。

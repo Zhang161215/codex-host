@@ -4,6 +4,7 @@ import { jsonValueSchema } from "@codexhost/shared-contracts";
 import { parseClaudeNativeFileChange } from "./file-change.js";
 import type {
   ClaudePlanLimitEvent,
+  ClaudePlanLimitWindow,
   ClaudeTransportFailureKind,
   ClaudeTransportTurnResult,
   ClaudeTurnEvent,
@@ -316,10 +317,23 @@ export function parseClaudePlanLimitEvent(message: unknown): ClaudePlanLimitEven
     if (flatWindow && info.rateLimitType === "five_hour") fiveHour = flatWindow;
     else if (flatWindow && info.rateLimitType === "seven_day") sevenDay = flatWindow;
   }
-  if (!fiveHour && !sevenDay) return null;
+  const rejected = info.status === "rejected";
+  if (rejected) {
+    // A refused request means the named window is used up, even when no utilization came with it.
+    const resetsAtUnix = safeNonNegativeInteger(info.resetsAt) ? info.resetsAt : undefined;
+    const exhausted = (window: ClaudePlanLimitWindow | undefined): ClaudePlanLimitWindow => ({
+      ...(resetsAtUnix !== undefined ? { resetsAtUnix } : {}),
+      ...window,
+      utilizationPercent: 100,
+    });
+    if (info.rateLimitType === "five_hour") fiveHour = exhausted(fiveHour);
+    else if (info.rateLimitType === "seven_day") sevenDay = exhausted(sevenDay);
+  }
+  if (!fiveHour && !sevenDay && !rejected) return null;
   return {
     ...(fiveHour ? { fiveHour } : {}),
     ...(sevenDay ? { sevenDay } : {}),
+    ...(rejected ? { rejected } : {}),
   };
 }
 

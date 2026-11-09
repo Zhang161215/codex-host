@@ -23,6 +23,8 @@ export interface RendererClaudeAccountClient {
 
 const HARNESS_ID = "claude-code";
 const LOGIN_POLL_MS = 2_000;
+/** How often an open section re-reads which account each conversation is on. */
+const STATUS_POLL_MS = 5_000;
 /** Matches the Host's limit on an imported file. */
 const IMPORT_LIMIT_BYTES = 3_000_000;
 const THRESHOLDS = [80, 85, 90, 95, 98, 100] as const;
@@ -115,7 +117,10 @@ export function mountClaudeAccounts(
   const status = document.createElement("p");
   status.className = "settings-claude-accounts__notice";
   status.setAttribute("aria-live", "polite");
-  section.append(header, login, card, footer, status);
+  const threadsLine = document.createElement("p");
+  threadsLine.className = "settings-claude-accounts__threads";
+  threadsLine.setAttribute("aria-live", "polite");
+  section.append(header, login, card, threadsLine, footer, status);
 
   fold.addEventListener("click", () => {
     expanded = !expanded;
@@ -173,6 +178,35 @@ export function mountClaudeAccounts(
     }, LOGIN_POLL_MS);
   };
   signal.addEventListener("abort", () => clearTimeout(pollTimer));
+
+  // Conversations change accounts at their own Turn boundaries, so an open section keeps
+  // re-reading where they stand. It never redraws under an edit or an open control.
+  const statusTimer = setInterval(() => {
+    const client = getClient();
+    if (
+      !client?.harnessAccountProfiles ||
+      section.hidden ||
+      busy ||
+      renaming !== null ||
+      state?.login?.status === "pending" ||
+      document.visibilityState === "hidden" ||
+      section.contains(document.activeElement)
+    ) {
+      return;
+    }
+    void client
+      .harnessAccountProfiles({
+        harnessId: HARNESS_ID,
+        action: "list",
+      } as HarnessAccountProfilesParams)
+      .then((next) => {
+        if (signal.aborted || busy || JSON.stringify(next) === JSON.stringify(state)) return;
+        state = next;
+        render();
+      })
+      .catch(() => undefined);
+  }, STATUS_POLL_MS);
+  signal.addEventListener("abort", () => clearInterval(statusTimer));
 
   add.addEventListener("click", () => {
     notice = null;
@@ -620,6 +654,31 @@ export function mountClaudeAccounts(
     }
   };
 
+  const renderThreads = (): void => {
+    const threads = state?.threads;
+    const total = threads ? threads.current + threads.nextMessage + threads.afterTurn : 0;
+    threadsLine.hidden = !expanded || !threads || total === 0;
+    if (!threads || total === 0) {
+      threadsLine.textContent = "";
+      return;
+    }
+    if (threads.current === total) {
+      threadsLine.textContent = fill(messages.threadsAll, { count: String(total) });
+      return;
+    }
+    const parts: Array<[number, string]> = [
+      [threads.current, messages.threadsCurrent],
+      [threads.nextMessage, messages.threadsNext],
+      [threads.afterTurn, messages.threadsAfter],
+    ];
+    threadsLine.textContent = fill(messages.threadsDone, {
+      parts: parts
+        .filter(([value]) => value > 0)
+        .map(([value, template]) => fill(template, { count: String(value) }))
+        .join(messages.threadsSeparator),
+    });
+  };
+
   function render(): void {
     if (!state) return;
     section.hidden = false;
@@ -641,6 +700,7 @@ export function mountClaudeAccounts(
       rows.unshift(empty);
     }
     card.replaceChildren(...rows);
+    renderThreads();
     renderFooter();
     status.textContent = notice ?? "";
     status.hidden = !notice;

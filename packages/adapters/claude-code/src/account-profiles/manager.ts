@@ -33,6 +33,8 @@ import {
   type StoredClaudeProfile,
   type StoredClaudeProfiles,
 } from "./store.js";
+import { claudeSignInEnvironment } from "./spawn-environment.js";
+import { nativeSignInKey, summarizeClaudeThreads, type ClaudeThreadSource } from "./threads.js";
 
 const CLAUDE_CODE_HARNESS_ID = harnessIdSchema.parse("claude-code");
 
@@ -44,6 +46,8 @@ const AUTO_SWITCH_COOLDOWN_MS = 2 * 60_000;
 /** Environment for one native Claude Code process; `key` changes whenever the sign-in does. */
 export interface ClaudeProfileSpawnEnvironment {
   key: string;
+  /** The saved profile the process signs in with, or null for Claude Code's own login. */
+  profileId: string | null;
   apply(environment: NodeJS.ProcessEnv): NodeJS.ProcessEnv;
 }
 
@@ -102,6 +106,7 @@ export class ClaudeAccountProfiles implements HarnessAccountProfilesCapability {
   readonly #usageFlights = new Map<string, Promise<void>>();
   #autoSwitchAt = 0;
   #autoSwitching: Promise<boolean> | null = null;
+  #threads: ClaudeThreadSource | null = null;
 
   constructor(options: ClaudeAccountProfilesOptions) {
     const directory = claudeAccountsDirectory(options.environment);
@@ -174,8 +179,16 @@ export class ClaudeAccountProfiles implements HarnessAccountProfilesCapability {
     return this.state();
   }
 
+  /** The open Threads whose sign-ins `state()` reports. */
+  attachThreads(source: ClaudeThreadSource): void {
+    this.#threads = source;
+  }
+
   async state(): Promise<HarnessAccountProfilesState> {
     const data = await this.#metadata.read();
+    const nativeKey = nativeSignInKey(
+      await readClaudeNativeIdentity(this.#environment).catch(() => null),
+    );
     const expiries = new Map(
       await Promise.all(
         data.profiles.map(async (profile) => {
@@ -189,6 +202,14 @@ export class ClaudeAccountProfiles implements HarnessAccountProfilesCapability {
     return {
       harnessId: CLAUDE_CODE_HARNESS_ID,
       native: await this.#nativeState(data),
+      ...(this.#threads
+        ? {
+            threads: summarizeClaudeThreads(this.#threads(), {
+              profileId: data.activeProfileId,
+              nativeKey,
+            }),
+          }
+        : {}),
       activeProfileId: data.activeProfileId,
       autoSwitch: data.autoSwitch,
       lastSwitch: data.lastSwitch,
@@ -522,14 +543,15 @@ export class ClaudeAccountProfiles implements HarnessAccountProfilesCapability {
       // session restarts, so a switch made by another tool reaches the next Turn.
       const identity = await readClaudeNativeIdentity(this.#environment).catch(() => null);
       return {
-        key: `native:${identity?.accountUuid ?? ""}:${identity?.organizationUuid ?? ""}`,
+        key: nativeSignInKey(identity),
+        profileId: null,
         apply: (environment) => environment,
       };
     }
     let tokens: ClaudeOAuthTokens;
+    const profile = data.profiles.find((item) => item.profileId === profileId);
     try {
       // A long-lived token Claude has rejected stays rejected until its account signs in again.
-      const profile = data.profiles.find((item) => item.profileId === profileId);
       if (profile?.status === "expired") {
         throw new Error("This Claude account's sign-in expired; sign in to it again");
       }
@@ -540,16 +562,15 @@ export class ClaudeAccountProfiles implements HarnessAccountProfilesCapability {
       }
       throw error;
     }
-    const accessToken = tokens.accessToken;
+    const signIn = {
+      accessToken: tokens.accessToken,
+      ...(profile?.plan ? { plan: profile.plan } : {}),
+      ...(profile?.organizationUuid ? { organizationUuid: profile.organizationUuid } : {}),
+    };
     return {
-      key: `${profileId}:${fingerprint(accessToken)}`,
-      apply(environment) {
-        const next: NodeJS.ProcessEnv = { ...environment, CLAUDE_CODE_OAUTH_TOKEN: accessToken };
-        // A process-level API key would take precedence over the subscription sign-in.
-        delete next.ANTHROPIC_API_KEY;
-        delete next.ANTHROPIC_AUTH_TOKEN;
-        return next;
-      },
+      key: `${profileId}:${fingerprint(signIn.accessToken)}`,
+      profileId,
+      apply: (environment) => claudeSignInEnvironment(environment, signIn),
     };
   }
 
@@ -577,14 +598,30 @@ export class ClaudeAccountProfiles implements HarnessAccountProfilesCapability {
     );
   }
 
-  /** Live quota pushed by a native session of the active profile; may switch accounts. */
-  observePlanLimit(planLimit: ClaudePlanLimitEvent): void {
-    void this.#observePlanLimit(planLimit).catch(() => undefined);
+  /**
+   * A native process signed in to `profileId` was refused authentication. The sign-in is checked
+   * again now, so a revoked one is marked expired and the next Turn moves to another account.
+   */
+  reportAuthenticationFailure(profileId: string): void {
+    void this.#refreshProfileUsage(profileId, true).catch(() => undefined);
   }
 
-  async #observePlanLimit(planLimit: ClaudePlanLimitEvent): Promise<void> {
+  /**
+   * Live quota pushed by a native process. `origin` is the sign-in that process runs under (a
+   * saved profile, or null for Claude Code's own login): a Thread still finishing a Turn on an
+   * earlier account reports that account, not the active one. Only the active account's quota
+   * can switch accounts; an undefined origin means the active one.
+   */
+  observePlanLimit(planLimit: ClaudePlanLimitEvent, origin?: string | null): void {
+    void this.#observePlanLimit(planLimit, origin).catch(() => undefined);
+  }
+
+  async #observePlanLimit(
+    planLimit: ClaudePlanLimitEvent,
+    origin: string | null | undefined,
+  ): Promise<void> {
     const data = await this.#metadata.read();
-    const activeId = data.activeProfileId;
+    const originId = origin === undefined ? data.activeProfileId : origin;
     const toWindow = (value: ClaudePlanLimitEvent["fiveHour"]) =>
       value
         ? {
@@ -596,7 +633,7 @@ export class ClaudeAccountProfiles implements HarnessAccountProfilesCapability {
         : undefined;
     const fiveHour = toWindow(planLimit.fiveHour);
     const sevenDay = toWindow(planLimit.sevenDay);
-    if (activeId === null) {
+    if (originId === null) {
       const identity = await readClaudeNativeIdentity(this.#environment).catch(() => null);
       const previous =
         this.#nativeUsage?.accountUuid === identity?.accountUuid ? this.#nativeUsage : null;
@@ -612,8 +649,8 @@ export class ClaudeAccountProfiles implements HarnessAccountProfilesCapability {
       };
     } else {
       await this.#mutate((next) => {
-        const profile = next.profiles.find((item) => item.profileId === activeId);
-        if (!profile || next.activeProfileId !== activeId) return;
+        const profile = next.profiles.find((item) => item.profileId === originId);
+        if (!profile) return;
         profile.usage = {
           ...profile.usage,
           ...(fiveHour ? { fiveHour } : {}),
@@ -622,10 +659,14 @@ export class ClaudeAccountProfiles implements HarnessAccountProfilesCapability {
         };
       });
     }
-    const used = Math.max(fiveHour?.usedPercent ?? 0, sevenDay?.usedPercent ?? 0);
-    if (!data.autoSwitch.enabled || used < data.autoSwitch.thresholdPercent) return;
-    if (this.#now() - this.#autoSwitchAt < AUTO_SWITCH_COOLDOWN_MS) return;
-    await this.#switchAway(activeId);
+    if (originId !== data.activeProfileId || !data.autoSwitch.enabled) return;
+    // Claude refusing a request is exhausted quota whatever the reported utilization.
+    const used = planLimit.rejected
+      ? 100
+      : Math.max(fiveHour?.usedPercent ?? 0, sevenDay?.usedPercent ?? 0);
+    if (used < data.autoSwitch.thresholdPercent) return;
+    if (!planLimit.rejected && this.#now() - this.#autoSwitchAt < AUTO_SWITCH_COOLDOWN_MS) return;
+    await this.#switchAway(originId);
   }
 
   /**

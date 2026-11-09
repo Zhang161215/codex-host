@@ -114,6 +114,7 @@ import {
   ClaudeAccountProfiles,
   type ClaudeProfileSpawnEnvironment,
 } from "./account-profiles/manager.js";
+import type { ClaudeThreadSignIn } from "./account-profiles/threads.js";
 import {
   CLAUDE_DEFAULT_THINKING_OPTION_ID,
   CLAUDE_THINKING_OPTIONS,
@@ -328,6 +329,8 @@ function parseClaudeHarnessCommand(
   return { ok: true, value: { id: "claude.compact", text: customInstructions } };
 }
 const DEFAULT_CLOSE_TIMEOUT_MS = 7_000;
+/** The plan-window key for Threads under Claude Code's own login. */
+const NATIVE_PLAN_ACCOUNT = "native";
 const DEFAULT_CANCEL_TIMEOUT_MS = 2_000;
 const DEFAULT_TOOL_OUTPUT_LIMIT = 64_000;
 const CONTEXT_USAGE_RETRY_DELAYS_MS = [0, 1_000, 2_000] as const;
@@ -622,7 +625,9 @@ class ClaudeHarnessSession implements HarnessSession {
   readonly #sessionEnvironment: NodeJS.ProcessEnv;
   readonly #resolveSignIn: (() => Promise<ClaudeProfileSpawnEnvironment | null>) | null;
   /** The sign-in the live transport was started under; a change restarts it at an idle Turn. */
-  #transportSignInKey: string | null = null;
+  /** The sign-in the running native process started with. */
+  #transportSignIn: ClaudeProfileSpawnEnvironment | null = null;
+  readonly #onSignInRejected: ((profileId: string) => void) | null;
   readonly #randomUUID: () => string;
   #requestedModel: HarnessModelRef | undefined;
   #requestedPermissionModeId: HarnessPermissionModeId;
@@ -677,6 +682,8 @@ class ClaudeHarnessSession implements HarnessSession {
       baseEnvironment: NodeJS.ProcessEnv;
       /** The saved sign-in a new native process must run under; null keeps Claude Code's own. */
       resolveSignIn?: () => Promise<ClaudeProfileSpawnEnvironment | null>;
+      /** Told when Claude refuses the saved sign-in a Turn ran under. */
+      onSignInRejected?: (profileId: string) => void;
       bypassPermissionsAvailable: boolean;
       openMode: "create" | "resume";
       sessionId: string;
@@ -714,6 +721,7 @@ class ClaudeHarnessSession implements HarnessSession {
       : dependencies.createTransport;
     this.#sessionEnvironment = environment ?? options.baseEnvironment;
     this.#resolveSignIn = options.resolveSignIn ?? null;
+    this.#onSignInRejected = options.onSignInRejected ?? null;
     this.#bypassPermissionsAvailable = options.bypassPermissionsAvailable;
     this.#randomUUID = dependencies.randomUUID;
     this.#readSessionMessages = dependencies.readSessionMessages;
@@ -1792,6 +1800,13 @@ class ClaudeHarnessSession implements HarnessSession {
     return task;
   }
 
+  /** The sign-in this Thread's native process runs under, or null when no process runs. */
+  signInStatus(): ClaudeThreadSignIn | null {
+    const signIn = this.#transportSignIn;
+    if (this.#phase !== "open" || !this.#transport || !signIn) return null;
+    return { profileId: signIn.profileId, key: signIn.key, idle: this.#transportIdle() };
+  }
+
   /** Whether the native process can be replaced without losing running Turn or background work. */
   #transportIdle(): boolean {
     return (
@@ -1810,7 +1825,7 @@ class ClaudeHarnessSession implements HarnessSession {
    */
   async #reuseOrRestartTransport(current: ClaudeTurnTransport): Promise<ClaudeTurnTransport> {
     const signIn = await this.#resolveSignIn?.();
-    if ((signIn?.key ?? null) === this.#transportSignInKey || !this.#transportIdle()) {
+    if ((signIn?.key ?? null) === (this.#transportSignIn?.key ?? null) || !this.#transportIdle()) {
       return current;
     }
     if (this.#transport !== current) return this.#transport ?? this.#startTransport(signIn);
@@ -1877,7 +1892,7 @@ class ClaudeHarnessSession implements HarnessSession {
         },
       });
       await transport.start();
-      this.#transportSignInKey = signIn?.key ?? null;
+      this.#transportSignIn = signIn;
       this.#state = {
         ...this.#configuredState(true),
         effectivePermissionModeId: encodeClaudePermissionModeId(transport.getPermissionMode()),
@@ -2560,6 +2575,8 @@ class ClaudeHarnessSession implements HarnessSession {
     } else if (result.status === "cancelled") {
       this.#finish(active, { status: "cancelled", reason: result.reason });
     } else {
+      const profileId = this.#transportSignIn?.profileId;
+      if (result.kind === "authentication" && profileId) this.#onSignInRejected?.(profileId);
       this.#finishFailed(active, transportFailure(result.kind));
     }
   }
@@ -3163,6 +3180,8 @@ export class ClaudeCodeAdapter implements HarnessAdapter {
   readonly #sessions = new Set<ClaudeHarnessSession>();
   #closePromise: Promise<void> | null = null;
   #latestPlanLimit: ClaudePlanLimitEvent | null = null;
+  /** Plan windows by sign-in (saved profile id, or NATIVE_PLAN_ACCOUNT): accounts do not share quota. */
+  readonly #planLimits = new Map<string, ClaudePlanLimitEvent>();
   #accountInspection: Promise<HarnessAccountSnapshot | null> | null = null;
   #accountCreditsSupported = false;
 
@@ -3178,6 +3197,12 @@ export class ClaudeCodeAdapter implements HarnessAdapter {
     if (this.#profiles) {
       const profiles = this.#profiles;
       this.accountProfiles = { handle: (request) => profiles.handle(request) };
+      profiles.attachThreads(() =>
+        [...this.#sessions].flatMap((session) => {
+          const status = session.signInStatus();
+          return status ? [status] : [];
+        }),
+      );
     }
     this.#importIndex = new ClaudeSessionImportIndex(environment);
     this.usageStatistics = createClaudeUsageStatistics(environment);
@@ -3625,7 +3650,11 @@ export class ClaudeCodeAdapter implements HarnessAdapter {
         ...(environment ? { environment } : {}),
         baseEnvironment: this.#environment,
         ...(this.#profiles
-          ? { resolveSignIn: () => this.#profiles?.spawnEnvironment() ?? Promise.resolve(null) }
+          ? {
+              resolveSignIn: () => this.#profiles?.spawnEnvironment() ?? Promise.resolve(null),
+              onSignInRejected: (profileId: string) =>
+                this.#profiles?.reportAuthenticationFailure(profileId),
+            }
           : {}),
         bypassPermissionsAvailable,
         openMode,
@@ -3673,13 +3702,19 @@ export class ClaudeCodeAdapter implements HarnessAdapter {
     }
   }
 
-  /** Account-level plan windows are shared, but only stable native pushes may update them. */
+  /**
+   * Plan windows are shared by the Threads signed in to one account, but only stable native
+   * pushes may update them. A Thread still on an earlier account neither reports nor receives
+   * the active account's quota.
+   */
   #recordPlanLimit(
     origin: ClaudeHarnessSession,
     planLimit: ClaudePlanLimitEvent,
   ): ClaudePlanLimitEvent | null {
-    this.#profiles?.observePlanLimit(planLimit);
-    const next: ClaudePlanLimitEvent = { ...(this.#latestPlanLimit ?? {}) };
+    const signIn = origin.signInStatus();
+    this.#profiles?.observePlanLimit(planLimit, signIn?.profileId);
+    const account = signIn?.profileId ?? NATIVE_PLAN_ACCOUNT;
+    const next: ClaudePlanLimitEvent = { ...(this.#planLimits.get(account) ?? {}) };
     if (planLimit.fiveHour) next.fiveHour = planLimit.fiveHour;
     if (planLimit.sevenDay) next.sevenDay = planLimit.sevenDay;
     try {
@@ -3691,10 +3726,15 @@ export class ClaudeCodeAdapter implements HarnessAdapter {
     }
     this.#latestPlanLimit = next.fiveHour || next.sevenDay ? next : null;
     if (this.#latestPlanLimit) {
+      this.#planLimits.set(account, this.#latestPlanLimit);
       this.#accountCreditsSupported = true;
       for (const session of this.#sessions) {
         session.publishAccountCreditsSupport(true);
-        if (session !== origin) session.publishPlanLimit(this.#latestPlanLimit);
+        if (session === origin) continue;
+        const other = session.signInStatus();
+        // A Thread with no process yet starts under the account that is reporting now.
+        if (other && (other.profileId ?? NATIVE_PLAN_ACCOUNT) !== account) continue;
+        session.publishPlanLimit(this.#latestPlanLimit);
       }
     }
     return this.#latestPlanLimit;
