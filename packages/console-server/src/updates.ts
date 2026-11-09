@@ -19,6 +19,7 @@ import {
   fetchLatestGitHubReleaseWithGitHubCli,
   recoverUpdateOperationLock,
   selectInstallerReleaseArtifact,
+  selectNpmReleaseArtifacts,
   readRuntimeMetadata,
   type BackgroundUpdateManager,
   type BackgroundUpdateStatus,
@@ -151,10 +152,10 @@ export function createConsoleUpdates(options: CreateConsoleUpdatesOptions): Cons
 
   function installable(metadata: DistributionMetadata, release: CodexhostLatestRelease): boolean {
     const kind = installationKind(metadata);
-    if (kind === "npm") return true;
     if (kind === null) return false;
     try {
-      selectInstallerReleaseArtifact(release, metadata.target as InstallerReleaseTarget);
+      if (kind === "npm") selectNpmReleaseArtifacts(release, metadata.target);
+      else selectInstallerReleaseArtifact(release, metadata.target as InstallerReleaseTarget);
       return true;
     } catch {
       return false;
@@ -194,6 +195,7 @@ export function createConsoleUpdates(options: CreateConsoleUpdatesOptions): Cons
       }
       return manager.prepareNpm({
         ...common,
+        packages: selectNpmReleaseArtifacts(release, metadata.target),
         packageRoot,
         nodePath: absoluteEnvironmentPath(environment, "CODEXHOST_NPM_NODE_PATH"),
         npmCliPath: absoluteEnvironmentPath(environment, "CODEXHOST_NPM_CLI_PATH"),

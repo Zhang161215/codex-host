@@ -55,7 +55,7 @@
 | [`harnesses/claude-code/claude-code-edit-recovery.md`](harnesses/claude-code/claude-code-edit-recovery.md) | 最后一条消息编辑后的独立 Session、空历史保留和关闭语义；修改编辑恢复时阅读。 |
 | [`harnesses/claude-code/claude-code-background-terminals.md`](harnesses/claude-code/claude-code-background-terminals.md) | Claude 后台命令作为 Desktop 后台终端：原生通知结算、实时输出、历史叠加与所有权；修改后台命令时阅读。 |
 | [`harnesses/claude-code/claude-code-steer.md`](harnesses/claude-code/claude-code-steer.md) | Claude Code `priority: "next"` 同轮插入、接受条件和历史分轮；修改运行中插入时阅读。 |
-| [`harnesses/claude-code/claude-code-accounts.md`](harnesses/claude-code/claude-code-accounts.md) | Claude Code 多账号：一年期登录、导入、本机登录只读显示、`CLAUDE_CODE_OAUTH_TOKEN` 注入并屏蔽外部供应商配置、空闲时按新账号 resume、Thread 切换状态与额度自动切换；修改账号切换时阅读。 |
+| [`harnesses/claude-code/claude-code-accounts.md`](harnesses/claude-code/claude-code-accounts.md) | Claude Code 多账号：一年期登录、导入、本机登录只读显示、`CLAUDE_CODE_OAUTH_TOKEN` 注入并屏蔽外部供应商配置、空闲时按新账号 resume、Thread 切换状态、额度自动切换与撞限额续跑、账号日志；修改账号切换时阅读。 |
 
 ### CodeBuddy、WorkBuddy 与 Cursor
 
@@ -175,7 +175,7 @@
 | --- | --- |
 | [`operations/remote-thread-read.md`](operations/remote-thread-read.md) | 通过现有 Desktop 远程连接跨 Harness 读取会话；包含部署要求、分页、响应大小与超时限制。 |
 | [`operations/host-runtime-log.md`](operations/host-runtime-log.md) | Host Runtime 日志的位置、内容与边界，以及 Web／Host 会话目录性能日志的按需开关和 Server-Timing；排查崩溃或慢查询时阅读。 |
-| [`operations/codexhost-console.md`](operations/codexhost-console.md) | 本地控制台的打开方式、页面、停止服务、Web 连接设备设置、项目公告、Host 连接、端口、诊断、安全与更新边界；排查启动失败或维护控制台时阅读。 |
+| [`operations/codexhost-console.md`](operations/codexhost-console.md) | 本地控制台的打开方式、页面、停止服务、Web 连接设备设置、项目公告、Host 连接、端口、诊断、安全与更新边界（含本分支从 fork Release 安装 npm 包）；排查启动失败或维护控制台时阅读。 |
 | [`NOTICE.md`](NOTICE.md) | Web 控制台打开或刷新时读取的项目公告，含显示开关、标题、类型与正文；默认关闭，发布规则见控制台文档。 |
 | [`operations/repository-maintenance.md`](operations/repository-maintenance.md) | PR 标签、CI 评论和发布前检查自动化；修改仓库自动化时阅读。 |
 

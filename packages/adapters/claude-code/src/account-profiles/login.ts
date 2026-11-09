@@ -4,6 +4,7 @@ import type { AddressInfo } from "node:net";
 
 import type { HarnessAccountLogin } from "@codexhost/shared-contracts";
 
+import { writeClaudeAccountLog, type ClaudeAccountLog } from "./log.js";
 import {
   claudeAuthorizeUrl,
   createClaudePkce,
@@ -34,8 +35,14 @@ interface PendingLogin {
   timer: ReturnType<typeof setTimeout>;
   status: "pending" | "completed" | "failed";
   finishing: Promise<void> | null;
+  /** Requests that reached the loopback callback, valid or not. */
+  callbacks: number;
   profileId?: string;
   error?: string;
+}
+
+function text(error: unknown): string {
+  return error instanceof Error ? error.message.slice(0, 300) : "unknown error";
 }
 
 function page(title: string, body: string): string {
@@ -75,6 +82,7 @@ export class ClaudeLoginFlow {
   constructor(
     private readonly fetchImpl: FetchLike,
     private readonly save: (result: ClaudeLoginResult) => Promise<string>,
+    private readonly log: ClaudeAccountLog = writeClaudeAccountLog,
   ) {}
 
   snapshot(): HarnessAccountLogin | null {
@@ -116,10 +124,12 @@ export class ClaudeLoginFlow {
         });
       });
     }
-    const timer = setTimeout(
-      () => this.#fail(loginId, "Sign-in timed out; start it again"),
-      LOGIN_TIMEOUT_MS,
-    );
+    const timer = setTimeout(() => {
+      if (this.#login?.loginId === loginId && this.#login.status === "pending") {
+        this.log("login.timedOut", { loginId, callbacks: this.#login.callbacks });
+      }
+      this.#fail(loginId, "Sign-in timed out; start it again");
+    }, LOGIN_TIMEOUT_MS);
     timer.unref?.();
     this.#login = {
       loginId,
@@ -133,7 +143,14 @@ export class ClaudeLoginFlow {
       timer,
       status: "pending",
       finishing: null,
+      callbacks: 0,
     };
+    this.log("login.started", {
+      loginId,
+      mode,
+      port,
+      loopbackIpv6: servers.length > 1,
+    });
   }
 
   #server(loginId: string): http.Server {
@@ -146,7 +163,14 @@ export class ClaudeLoginFlow {
       }
       const code = url.searchParams.get("code");
       const state = url.searchParams.get("state");
+      login.callbacks += 1;
       if (!code || state !== login.pkce.state) {
+        this.log("login.callbackRejected", {
+          loginId,
+          reason: !code
+            ? (url.searchParams.get("error") ?? "no code").slice(0, 64)
+            : "state mismatch",
+        });
         response
           .writeHead(400, { "Content-Type": "text/html; charset=utf-8" })
           .end(page("Sign-in failed", "The authorization response was not recognized."));
@@ -173,6 +197,7 @@ export class ClaudeLoginFlow {
     if (state !== undefined && state !== login.pkce.state) {
       throw new Error("The pasted code belongs to a different sign-in");
     }
+    this.log("login.codePasted", { loginId, via: viaCallback ? "callback link" : "code page" });
     // A code from the code page was issued for its redirect; a pasted loopback link for ours.
     await this.#finish(login, code, viaCallback ? login.port : null);
     // `#finish` settles the login; read it back through the snapshot to drop the narrowing.
@@ -190,13 +215,27 @@ export class ClaudeLoginFlow {
         });
         // The profile adds the plan; the identity from the token response is enough without it.
         const profile = await fetchClaudeProfile(this.fetchImpl, tokens.accessToken).catch(
-          () => ({}),
+          (error: unknown) => {
+            this.log("login.profileUnavailable", { loginId: login.loginId, error: text(error) });
+            return {};
+          },
         );
         login.profileId = await this.save({ tokens, profile: { ...identity, ...profile } });
         login.status = "completed";
+        this.log("login.completed", {
+          loginId: login.loginId,
+          profileId: login.profileId,
+          // Seconds until the new access token expires; a one-year sign-in shows ~31536000.
+          lifetimeSeconds:
+            tokens.expiresAt !== undefined
+              ? Math.round((tokens.expiresAt - Date.now()) / 1000)
+              : null,
+          refreshable: tokens.refreshToken !== undefined,
+        });
       } catch (error) {
         login.status = "failed";
         login.error = error instanceof Error ? error.message.slice(0, 500) : "Sign-in failed";
+        this.log("login.failed", { loginId: login.loginId, error: login.error });
       } finally {
         this.#stop(login);
       }
@@ -221,6 +260,7 @@ export class ClaudeLoginFlow {
   cancel(loginId: string): void {
     const login = this.#login;
     if (!login || login.loginId !== loginId) return;
+    if (login.status === "pending") this.log("login.cancelled", { loginId });
     this.#stop(login);
     this.#login = null;
   }

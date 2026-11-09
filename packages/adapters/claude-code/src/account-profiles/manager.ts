@@ -33,6 +33,7 @@ import {
   type StoredClaudeProfile,
   type StoredClaudeProfiles,
 } from "./store.js";
+import { writeClaudeAccountLog, type ClaudeAccountLog } from "./log.js";
 import { claudeSignInEnvironment } from "./spawn-environment.js";
 import { nativeSignInKey, summarizeClaudeThreads, type ClaudeThreadSource } from "./threads.js";
 
@@ -58,6 +59,8 @@ export interface ClaudeAccountProfilesOptions {
   /** Where Claude Code keeps its own token; defaults to this process's platform. */
   platform?: NodeJS.Platform;
   now?: () => number;
+  /** Diagnostics sink; defaults to the Host Runtime log. */
+  log?: ClaudeAccountLog;
 }
 
 function message(error: unknown, fallback: string): string {
@@ -106,7 +109,10 @@ export class ClaudeAccountProfiles implements HarnessAccountProfilesCapability {
   readonly #usageFlights = new Map<string, Promise<void>>();
   #autoSwitchAt = 0;
   #autoSwitching: Promise<boolean> | null = null;
+  /** Settles once every plan-limit observation made so far has been applied. */
+  #observations: Promise<void> = Promise.resolve();
   #threads: ClaudeThreadSource | null = null;
+  readonly #log: ClaudeAccountLog;
 
   constructor(options: ClaudeAccountProfilesOptions) {
     const directory = claudeAccountsDirectory(options.environment);
@@ -116,9 +122,12 @@ export class ClaudeAccountProfiles implements HarnessAccountProfilesCapability {
     this.#now = options.now ?? Date.now;
     this.#environment = options.environment;
     this.#platform = options.platform ?? process.platform;
-    this.#login = new ClaudeLoginFlow(this.#fetch, async (result) => {
-      return (await this.#saveAccount(result, { replaceUsable: true })).profileId;
-    });
+    this.#log = options.log ?? writeClaudeAccountLog;
+    this.#login = new ClaudeLoginFlow(
+      this.#fetch,
+      async (result) => (await this.#saveAccount(result, { replaceUsable: true })).profileId,
+      this.#log,
+    );
   }
 
   /** Serializes read-modify-write of the metadata file within this Host. */
@@ -260,6 +269,7 @@ export class ClaudeAccountProfiles implements HarnessAccountProfilesCapability {
             };
       summary[(await this.#saveAccount({ ...account, profile })).outcome] += 1;
     }
+    this.#log("import.completed", { ...summary });
     return summary;
   }
 
@@ -420,6 +430,7 @@ export class ClaudeAccountProfiles implements HarnessAccountProfilesCapability {
         if (profile.status === "expired") throw new Error("Sign in to this account again first");
       }
       if (data.activeProfileId === profileId) return;
+      this.#log("account.switched", { from: data.activeProfileId, to: profileId, reason });
       data.lastSwitch = this.#switchRecord(data.activeProfileId, profileId, reason);
       data.activeProfileId = profileId;
     });
@@ -428,6 +439,7 @@ export class ClaudeAccountProfiles implements HarnessAccountProfilesCapability {
   async #remove(profileId: string): Promise<void> {
     await this.#mutate(async (data) => {
       data.profiles = data.profiles.filter((item) => item.profileId !== profileId);
+      this.#log("account.removed", { profileId, wasActive: data.activeProfileId === profileId });
       if (data.activeProfileId === profileId) {
         data.lastSwitch = this.#switchRecord(profileId, null, "manual");
         data.activeProfileId = null;
@@ -440,6 +452,7 @@ export class ClaudeAccountProfiles implements HarnessAccountProfilesCapability {
     await this.#mutate((data) => {
       const profile = data.profiles.find((item) => item.profileId === profileId);
       if (!profile) return;
+      if (profile.status !== "expired") this.#log("account.expired", { profileId, error });
       profile.status = "expired";
       profile.error = error;
     }).catch(() => undefined);
@@ -466,8 +479,10 @@ export class ClaudeAccountProfiles implements HarnessAccountProfilesCapability {
       try {
         const refreshed = await refreshClaudeTokens(this.#fetch, stored);
         await this.#tokens.write(profileId, refreshed);
+        this.#log("token.refreshed", { profileId });
         return refreshed;
       } catch (error) {
+        this.#log("token.refreshFailed", { profileId, error: message(error, "unknown error") });
         if (error instanceof ClaudeOAuthError && error.revoked) {
           await this.#markExpired(profileId, "Sign-in expired or was revoked");
           throw new Error("This Claude account's sign-in expired; sign in to it again");
@@ -557,6 +572,7 @@ export class ClaudeAccountProfiles implements HarnessAccountProfilesCapability {
       }
       tokens = await this.#tokensFor(profileId);
     } catch (error) {
+      this.#log("signIn.unusable", { profileId, error: message(error, "unknown error") });
       if (data.autoSwitch.enabled && (await this.#switchAway(profileId))) {
         return this.spawnEnvironment();
       }
@@ -603,6 +619,7 @@ export class ClaudeAccountProfiles implements HarnessAccountProfilesCapability {
    * again now, so a revoked one is marked expired and the next Turn moves to another account.
    */
   reportAuthenticationFailure(profileId: string): void {
+    this.#log("turn.authenticationFailed", { profileId });
     void this.#refreshProfileUsage(profileId, true).catch(() => undefined);
   }
 
@@ -613,7 +630,35 @@ export class ClaudeAccountProfiles implements HarnessAccountProfilesCapability {
    * can switch accounts; an undefined origin means the active one.
    */
   observePlanLimit(planLimit: ClaudePlanLimitEvent, origin?: string | null): void {
-    void this.#observePlanLimit(planLimit, origin).catch(() => undefined);
+    const observed = this.#observePlanLimit(planLimit, origin).catch(() => undefined);
+    this.#observations = Promise.all([this.#observations, observed]).then(() => undefined);
+  }
+
+  /**
+   * Whether a Turn Claude refused under `origin` because of its limit should continue on another
+   * account: the switch its rejection caused has settled on a different sign-in, and the user
+   * keeps continuation on.
+   */
+  async continuationAfterLimit(origin: string | null): Promise<boolean> {
+    await this.#observations;
+    await this.#autoSwitching?.catch(() => false);
+    const data = await this.#metadata.read();
+    const switched = data.activeProfileId !== origin;
+    const proceed = data.autoSwitch.enabled && data.autoSwitch.continueAfterLimit && switched;
+    this.#log(proceed ? "continuation.started" : "continuation.skipped", {
+      from: origin,
+      to: data.activeProfileId,
+      ...(proceed
+        ? {}
+        : {
+            reason: !data.autoSwitch.enabled
+              ? "autoSwitchOff"
+              : !data.autoSwitch.continueAfterLimit
+                ? "continuationOff"
+                : "noOtherAccount",
+          }),
+    });
+    return proceed;
   }
 
   async #observePlanLimit(
@@ -659,6 +704,12 @@ export class ClaudeAccountProfiles implements HarnessAccountProfilesCapability {
         };
       });
     }
+    if (planLimit.rejected) {
+      this.#log("quota.rejected", {
+        profileId: originId,
+        active: originId === data.activeProfileId,
+      });
+    }
     if (originId !== data.activeProfileId || !data.autoSwitch.enabled) return;
     // Claude refusing a request is exhausted quota whatever the reported utilization.
     const used = planLimit.rejected
@@ -666,6 +717,11 @@ export class ClaudeAccountProfiles implements HarnessAccountProfilesCapability {
       : Math.max(fiveHour?.usedPercent ?? 0, sevenDay?.usedPercent ?? 0);
     if (used < data.autoSwitch.thresholdPercent) return;
     if (!planLimit.rejected && this.#now() - this.#autoSwitchAt < AUTO_SWITCH_COOLDOWN_MS) return;
+    this.#log("autoSwitch.triggered", {
+      from: originId,
+      usedPercent: used,
+      rejected: planLimit.rejected === true,
+    });
     await this.#switchAway(originId);
   }
 
@@ -693,7 +749,10 @@ export class ClaudeAccountProfiles implements HarnessAccountProfilesCapability {
         .filter(({ used }) => used === null || used < fresh.autoSwitch.thresholdPercent)
         .sort((left, right) => (left.used ?? 50) - (right.used ?? 50));
       const target = ranked[0]?.item;
-      if (!target) return false;
+      if (!target) {
+        this.#log("autoSwitch.noAccount", { from: fromProfileId });
+        return false;
+      }
       this.#autoSwitchAt = this.#now();
       await this.#activate(target.profileId, "auto");
       return true;

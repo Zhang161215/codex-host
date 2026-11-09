@@ -1,13 +1,17 @@
 import type { ArtifactSource } from "./artifact.js";
 import { requireSemanticVersion } from "./status.js";
 
-export const CODEXHOST_LATEST_RELEASE_URL =
-  "https://api.github.com/repos/BytePioneer-AI/codex-host/releases/latest";
+/**
+ * Updates come from the Releases of the repository this build is published from, so an install
+ * of the fork keeps receiving the fork rather than the upstream build.
+ */
+export const CODEXHOST_RELEASE_REPOSITORY = "Zhang161215/codex-host";
+export const CODEXHOST_LATEST_RELEASE_URL = `https://api.github.com/repos/${CODEXHOST_RELEASE_REPOSITORY}/releases/latest`;
 
 const SHA256_DIGEST_PATTERN = /^sha256:([0-9a-f]{64})$/u;
 const RELEASE_NOTES_URL_PATTERN =
-  /^https:\/\/github\.com\/BytePioneer-AI\/codex-host\/releases\/tag\/(v[0-9A-Za-z.+-]+)$/u;
-const DOWNLOAD_URL_PREFIX = "https://github.com/BytePioneer-AI/codex-host/releases/download/";
+  /^https:\/\/github\.com\/Zhang161215\/codex-host\/releases\/tag\/(v[0-9A-Za-z.+-]+)$/u;
+const DOWNLOAD_URL_PREFIX = `https://github.com/${CODEXHOST_RELEASE_REPOSITORY}/releases/download/`;
 
 export type InstallerReleaseTarget = "macos-arm64" | "macos-x64" | "windows-x64" | "windows-arm64";
 export type ReleaseTarget = InstallerReleaseTarget | "linux-x64" | "linux-arm64";
@@ -168,7 +172,28 @@ export function selectInstallerReleaseArtifact(
   release: CodexhostLatestRelease,
   target: InstallerReleaseTarget,
 ): SelectedReleaseArtifact {
-  const name = expectedInstallerAssetName(release.version, target);
+  return selectReleaseAsset(release, expectedInstallerAssetName(release.version, target));
+}
+
+/**
+ * The npm packages a Release ships for `target`: its platform package and the `@codexhost/cli`
+ * package, installed together from the Release rather than resolved from the npm registry.
+ */
+export function selectNpmReleaseArtifacts(
+  release: CodexhostLatestRelease,
+  target: ReleaseTarget,
+): readonly SelectedReleaseArtifact[] {
+  const version = requireSemanticVersion(release.version);
+  return Object.freeze([
+    selectReleaseAsset(release, `codexhost-cli-${version}-${target}.tgz`),
+    selectReleaseAsset(release, `codexhost-cli-${version}.tgz`),
+  ]);
+}
+
+function selectReleaseAsset(
+  release: CodexhostLatestRelease,
+  name: string,
+): SelectedReleaseArtifact {
   const matches = release.assets.filter((asset) => asset.name === name);
   if (matches.length !== 1) throw new Error(`GitHub Release must contain exactly one ${name}`);
   const asset = matches[0];

@@ -26,6 +26,9 @@ export const claudeAccountEnglish = {
   autoSwitchHint:
     "When the account in use reaches the threshold, move to the one with most quota left.",
   threshold: "Threshold",
+  continueAfterLimit: "Continue after a limit",
+  continueAfterLimitHint:
+    "If Claude refuses a reply because the limit was reached, the Thread sends “继续” on the new account and carries on.",
   lastAuto: "Switched automatically to {name} at {time}",
   loginPending:
     "Open the sign-in page in this computer's browser, or copy the sign-in link to any browser or device.",
@@ -88,6 +91,8 @@ export const claudeAccountChinese: ClaudeAccountMessages = {
   autoSwitch: "自动切换",
   autoSwitchHint: "当前账号额度达到阈值时，自动切到剩余额度最多的账号。",
   threshold: "阈值",
+  continueAfterLimit: "撞限额自动续跑",
+  continueAfterLimitHint: "回复因额度用完被拒时，换号后在原对话自动发「继续」接着做。",
   lastAuto: "已于 {time} 自动切换到「{name}」",
   loginPending: "点「打开登录页」在本机浏览器登录，或复制登录链接到任意浏览器、其他设备打开。",
   loginCopy: "复制登录链接",

@@ -132,7 +132,7 @@ describe("Release notes Markdown", () => {
         "Use `codexhost` and **restart** after install.",
         "",
         "1. Download the package",
-        "2. Open [Releases](https://github.com/BytePioneer-AI/codex-host/releases)",
+        "2. Open [Releases](https://github.com/Zhang161215/codex-host/releases)",
       ].join("\n"),
     );
 
@@ -143,9 +143,7 @@ describe("Release notes Markdown", () => {
     expect(strong?.textContent).toBe("restart");
     const link = descendants(root).find((element) => element.tagName === "a");
     expect(link?.textContent).toBe("Releases");
-    expect(link?.attributes.get("href")).toBe(
-      "https://github.com/BytePioneer-AI/codex-host/releases",
-    );
+    expect(link?.attributes.get("href")).toBe("https://github.com/Zhang161215/codex-host/releases");
     expect(link?.attributes.get("target")).toBe("_blank");
     expect(link?.attributes.get("rel")).toBe("noopener noreferrer");
   });

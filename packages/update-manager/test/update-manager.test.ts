@@ -251,6 +251,56 @@ describe("background update manager", () => {
     ]);
   });
 
+  it("downloads and verifies a Release's npm archives before creating a request", async () => {
+    const root = await temporaryDirectory();
+    const bytes = Buffer.from("npm-archive");
+    const npmFiles = {
+      nodePath: path.join(root, "node", "node"),
+      npmCliPath: path.join(root, "node", "npm-cli.js"),
+      npmLauncherPath: path.join(root, "npm", "bin", "codexhost.js"),
+    };
+    for (const filePath of Object.values(npmFiles)) {
+      await mkdir(path.dirname(filePath), { recursive: true });
+      await writeFile(filePath, "fixture\n");
+    }
+    const manager = createBackgroundUpdateManager({
+      platform: "darwin",
+      randomId: () => "npm-archives",
+      download: downloader(bytes),
+    });
+    const source = (name: string) => ({
+      name,
+      source: { url: `https://downloads.example.test/${name}`, sha256: sha256(bytes), size: 11 },
+    });
+    const prepared = await manager.prepareNpm({
+      ...(await commonOptions(root)),
+      ...npmFiles,
+      packageRoot: path.join(root, "npm", "platform-package"),
+      packages: [source("codexhost-cli-1.2.3-test.4-macos-arm64.tgz"), source("meta.tgz")],
+    });
+    const operation = path.dirname(prepared.requestPath);
+    const request = JSON.parse(await readFile(prepared.requestPath, "utf8"));
+    expect(request.installation.packages).toEqual([
+      { path: path.join(operation, "npm-package-1.tgz"), sha256: sha256(bytes) },
+      { path: path.join(operation, "npm-package-2.tgz"), sha256: sha256(bytes) },
+    ]);
+    expect(await readFile(path.join(operation, "npm-package-2.tgz"))).toEqual(bytes);
+
+    await expect(
+      manager.prepareNpm({
+        ...(await commonOptions(root)),
+        ...npmFiles,
+        packageRoot: path.join(root, "npm", "platform-package"),
+        packages: [
+          {
+            name: "tampered.tgz",
+            source: { url: "https://downloads.example.test/t.tgz", sha256: "0".repeat(64) },
+          },
+        ],
+      }),
+    ).rejects.toThrow();
+  });
+
   it("downloads and verifies the Windows installer before creating a request", async () => {
     const root = await temporaryDirectory();
     const bytes = Buffer.from("signed-or-reviewed-inno-installer");

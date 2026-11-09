@@ -626,20 +626,40 @@ export function mountClaudeAccounts(
       select.append(option);
     }
     threshold.append(thresholdText, select);
+    const resume = document.createElement("label");
+    resume.className = "settings-claude-accounts__auto";
+    const resumeToggle = document.createElement("input");
+    resumeToggle.type = "checkbox";
+    resumeToggle.checked = state.autoSwitch.continueAfterLimit;
+    resumeToggle.disabled = busy || !state.autoSwitch.enabled;
+    const resumeText = document.createElement("span");
+    resumeText.textContent = messages.continueAfterLimit;
+    resume.append(resumeToggle, resumeText);
     const save = (): void => {
       void request({
         action: "autoSwitch.set",
-        autoSwitch: { enabled: toggle.checked, thresholdPercent: Number(select.value) },
+        autoSwitch: {
+          enabled: toggle.checked,
+          thresholdPercent: Number(select.value),
+          continueAfterLimit: resumeToggle.checked,
+        },
       });
     };
     toggle.addEventListener("change", save);
     select.addEventListener("change", save);
+    resumeToggle.addEventListener("change", save);
     const help = document.createElement("p");
     help.className = "settings-claude-accounts__help";
-    help.textContent = `${messages.autoSwitchHint} ${messages.applyNote}`;
+    help.textContent = [
+      messages.autoSwitchHint,
+      ...(state.autoSwitch.enabled && state.autoSwitch.continueAfterLimit
+        ? [messages.continueAfterLimitHint]
+        : []),
+      messages.applyNote,
+    ].join(" ");
     const controls = document.createElement("div");
     controls.className = "settings-claude-accounts__controls";
-    controls.append(auto, threshold);
+    controls.append(auto, threshold, resume);
     footer.replaceChildren(controls, help);
     const last = state.lastSwitch;
     if (last?.reason === "auto" && last.toProfileId) {

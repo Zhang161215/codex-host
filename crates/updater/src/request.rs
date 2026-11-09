@@ -48,7 +48,19 @@ pub(crate) struct NpmInstallation {
     pub(crate) npm_launcher_path: PathBuf,
     /// The platform package whose executables Windows must close before npm replaces them.
     pub(crate) npm_package_root: PathBuf,
+    /// Release package archives installed in place of `@codexhost/cli` from the npm registry.
+    #[serde(default)]
+    pub(crate) packages: Vec<NpmPackage>,
 }
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NpmPackage {
+    pub(crate) path: PathBuf,
+    pub(crate) sha256: String,
+}
+
+const MAX_NPM_PACKAGES: usize = 4;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -191,6 +203,26 @@ impl UpdateRequest {
                 require_absolute_file(&npm.npm_cli_path, "npm CLI")?;
                 require_absolute_file(&npm.npm_launcher_path, "npm codexhost launcher")?;
                 require_absolute_path(&npm.npm_package_root, "npm platform package root")?;
+                if npm.packages.len() > MAX_NPM_PACKAGES {
+                    return Err("npm update lists too many package archives".into());
+                }
+                // Archives were downloaded into this operation's directory and nowhere else.
+                let operation = self.status_path.parent();
+                for package in &npm.packages {
+                    require_absolute_file(&package.path, "npm package archive")?;
+                    if package.path.parent() != operation
+                        || package.path.extension().and_then(|value| value.to_str()) != Some("tgz")
+                    {
+                        return Err(
+                            "npm package archive must be a .tgz in the update directory".into()
+                        );
+                    }
+                    if !valid_sha256(&package.sha256) {
+                        return Err(
+                            "npm package archive SHA-256 must be lowercase hexadecimal".into()
+                        );
+                    }
+                }
             }
             Installation::WindowsInstaller(windows) => {
                 if !cfg!(target_os = "windows") {
@@ -239,6 +271,43 @@ mod tests {
         assert!(valid_sha256(&"ab".repeat(32)));
         assert!(!valid_sha256(&"AB".repeat(32)));
         assert!(!valid_sha256("abcd"));
+    }
+
+    #[test]
+    fn npm_package_archives_must_be_verified_tgz_files_in_the_update_directory() {
+        let operation = std::env::temp_dir().join(format!("updater-npm-{}", std::process::id()));
+        std::fs::create_dir_all(&operation).unwrap();
+        let archive = operation.join("npm-package-1.tgz");
+        std::fs::write(&archive, b"archive").unwrap();
+        let outside = std::env::temp_dir().join(format!("updater-npm-{}.tgz", std::process::id()));
+        std::fs::write(&outside, b"archive").unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let request = |path: &std::path::Path, sha256: &str| {
+            serde_json::json!({
+                "schema_version":1, "version":"1.2.3-fork.2",
+                "wait_pid":if std::process::id() == 1 {2} else {1},
+                "wait_executable":executable, "runtime_descriptor_path":operation.join("d.json"),
+                "status_path":operation.join("status-v1.json"), "installation": {
+                    "kind":"npm", "node_path":executable, "npm_cli_path":executable,
+                    "npm_launcher_path":executable, "npm_package_root":operation,
+                    "packages":[{"path":path, "sha256":sha256}],
+                }
+            })
+        };
+        let valid = "ab".repeat(32);
+        let parse = |value| {
+            serde_json::from_value::<UpdateRequest>(value)
+                .unwrap()
+                .validate()
+        };
+        parse(request(&archive, &valid)).unwrap();
+        assert!(parse(request(&outside, &valid)).is_err());
+        assert!(parse(request(&archive, &"AB".repeat(32))).is_err());
+        let renamed = operation.join("npm-package-1.zip");
+        std::fs::write(&renamed, b"archive").unwrap();
+        assert!(parse(request(&renamed, &valid)).is_err());
+        std::fs::remove_dir_all(&operation).unwrap();
+        std::fs::remove_file(&outside).unwrap();
     }
 
     #[test]

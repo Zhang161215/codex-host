@@ -8149,6 +8149,10 @@ describe("saved Claude sign-ins", () => {
       })),
       observePlanLimit: vi.fn(),
       reportAuthenticationFailure: vi.fn(),
+      continuationAfterLimit: vi.fn(async (origin: string | null) => {
+        await Promise.resolve();
+        return origin !== `profile-${signIn.key}`;
+      }),
       attachThreads: vi.fn((source: () => Iterable<ClaudeThreadSignIn>) => {
         threads = source;
       }),
@@ -8319,6 +8323,85 @@ describe("saved Claude sign-ins", () => {
       await vi.waitFor(() =>
         expect(stub.reportAuthenticationFailure).toHaveBeenCalledWith("profile-first"),
       );
+    } finally {
+      await adapter.close();
+    }
+  });
+
+  it("continues a Turn refused for its limit on the account the switch moved to", async () => {
+    const { signIn, profiles, stub } = signInStub();
+    const { adapter, dependencies, transports } = fixture({ accountProfiles: profiles });
+    try {
+      const session = await openSession(adapter);
+      const outputs: HarnessOutput[] = [];
+      const consuming = (async () => {
+        for await (const output of session.outputs) outputs.push(output);
+      })();
+      await session.execute(textTurn("turn-1"));
+      await vi.waitFor(() => expect(transports[0]?.turns).toHaveLength(1));
+      defined(transports[0]).planLimit({ fiveHour: { utilizationPercent: 100 }, rejected: true });
+      signIn.key = "second";
+      defined(transports[0]).finish({ status: "failed", kind: "native" });
+
+      await vi.waitFor(() => expect(transports[1]?.turns).toHaveLength(1));
+      expect(stub.continuationAfterLimit).toHaveBeenCalledWith("profile-first");
+      expect(defined(transports[1]).turns[0]?.text).toBe("继续");
+      expect(dependencies.createTransport).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          openMode: "resume",
+          environment: expect.objectContaining({ CLAUDE_CODE_OAUTH_TOKEN: "token-second" }),
+        }),
+      );
+      const started = outputs.find(
+        (output) => output.kind === "event" && output.event.type === "turn.autonomous.started",
+      );
+      expect(started).toMatchObject({ event: { input: [{ type: "text", text: "继续" }] } });
+      expect(
+        outputs.find(
+          (output) =>
+            output.kind === "event" &&
+            output.event.type === "turn.completed" &&
+            output.event.turnId === "turn-1",
+        ),
+      ).toMatchObject({ event: { outcome: { status: "failed" } } });
+      defined(transports[1]).finish({ status: "succeeded" });
+      await session.close();
+      await consuming;
+    } finally {
+      await adapter.close();
+    }
+  });
+
+  it("does not continue a failed Turn that Claude never refused for its limit", async () => {
+    const { signIn, profiles, stub } = signInStub();
+    const { adapter, transports } = fixture({ accountProfiles: profiles });
+    try {
+      const session = await openSession(adapter);
+      await session.execute(textTurn("turn-1"));
+      await vi.waitFor(() => expect(transports[0]?.turns).toHaveLength(1));
+      signIn.key = "second";
+      defined(transports[0]).finish({ status: "failed", kind: "native" });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(stub.continuationAfterLimit).not.toHaveBeenCalled();
+      expect(transports).toHaveLength(1);
+    } finally {
+      await adapter.close();
+    }
+  });
+
+  it("stays on the refused account when no switch happened", async () => {
+    const { profiles, stub } = signInStub();
+    const { adapter, transports } = fixture({ accountProfiles: profiles });
+    try {
+      const session = await openSession(adapter);
+      await session.execute(textTurn("turn-1"));
+      await vi.waitFor(() => expect(transports[0]?.turns).toHaveLength(1));
+      defined(transports[0]).planLimit({ rejected: true });
+      defined(transports[0]).finish({ status: "failed", kind: "native" });
+      await vi.waitFor(() => expect(stub.continuationAfterLimit).toHaveBeenCalled());
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(transports).toHaveLength(1);
+      expect(defined(transports[0]).turns).toHaveLength(1);
     } finally {
       await adapter.close();
     }

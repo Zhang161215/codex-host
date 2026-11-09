@@ -49,6 +49,11 @@ export interface NpmUpdateOptions extends CommonUpdateOptions {
   npmCliPath: string;
   npmLauncherPath: string;
   packageRoot: string;
+  /**
+   * Release package archives npm installs instead of resolving `@codexhost/cli` from the
+   * registry; each is downloaded and verified before the Updater starts.
+   */
+  packages?: readonly { name: string; source: ArtifactSource }[];
 }
 
 export interface WindowsInstallerUpdateOptions extends CommonUpdateOptions {
@@ -113,6 +118,7 @@ interface InternalRequest {
         npm_cli_path: string;
         npm_launcher_path: string;
         npm_package_root: string;
+        packages?: { path: string; sha256: string }[];
       }
     | {
         kind: "windows-installer";
@@ -433,6 +439,17 @@ export function createBackgroundUpdateManager(
   return Object.freeze({
     async prepareNpm(options: NpmUpdateOptions): Promise<PreparedBackgroundUpdate> {
       const common = await prepareCommon(options, "npm");
+      const packages: { path: string; sha256: string }[] = [];
+      for (const [index, item] of (options.packages ?? []).entries()) {
+        // The archive name only labels the file; the operation directory owns its location.
+        const artifact = await prepareArtifact(
+          common,
+          "npm",
+          item.source,
+          `npm-package-${index + 1}.tgz`,
+        );
+        packages.push({ path: artifact.artifactPath, sha256: artifact.source.sha256 });
+      }
       try {
         return await finalize(common, {
           kind: "npm",
@@ -443,6 +460,7 @@ export function createBackgroundUpdateManager(
             "npm codexhost launcher",
           ),
           npm_package_root: requireAbsolutePath(options.packageRoot, "npm platform package root"),
+          ...(packages.length > 0 ? { packages } : {}),
         });
       } catch (error) {
         await writeFailedStatus(common.statusPath, common.version, "npm", error);

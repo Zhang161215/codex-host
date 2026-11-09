@@ -4,6 +4,7 @@ import path from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import type { ClaudeAccountLog } from "../src/account-profiles/log.js";
 import type { ClaudeThreadSignIn } from "../src/account-profiles/threads.js";
 import { ClaudeAccountProfiles } from "../src/account-profiles/manager.js";
 import { parsePastedAuthorization } from "../src/account-profiles/login.js";
@@ -141,6 +142,7 @@ async function setup(accounts: Record<string, FakeAccount>, now = () => Date.now
   directories.push(directory);
   const tokens = memoryTokens();
   const anthropic = fakeAnthropic(accounts);
+  const log = vi.fn<ClaudeAccountLog>();
   const profiles = new ClaudeAccountProfiles({
     // Claude Code's own login is read from here, never from this machine's real one.
     environment: {
@@ -151,6 +153,7 @@ async function setup(accounts: Record<string, FakeAccount>, now = () => Date.now
     fetch: anthropic.fetch,
     tokenStore: tokens,
     now,
+    log,
   });
   const signIn = async (code: string) => {
     const started = await profiles.handle({ action: "login.start", mode: "manual" });
@@ -162,7 +165,7 @@ async function setup(accounts: Record<string, FakeAccount>, now = () => Date.now
       code: `${code}#${state}`,
     });
   };
-  return { profiles, tokens, anthropic, signIn, directory };
+  return { profiles, tokens, anthropic, signIn, directory, log };
 }
 
 /** Claude Code's own login as it keeps it on disk outside macOS. */
@@ -476,13 +479,69 @@ describe("Claude account profiles", () => {
     expect(defined(spawn).apply({}).CLAUDE_CODE_OAUTH_TOKEN).toMatch(/^access-bob-/u);
   });
 
+  it("a Turn refused for its limit continues once the switch has moved to another account", async () => {
+    const { profiles, signIn } = await setup({ "code-a": alice, "code-b": bob });
+    await signIn("code-a");
+    const state = await signIn("code-b");
+    const aliceId = defined(state.activeProfileId);
+    const bobId = defined(state.profiles.find((item) => item.email === bob.email)).profileId;
+    profiles.observePlanLimit({ rejected: true }, aliceId);
+    await expect(profiles.continuationAfterLimit(aliceId)).resolves.toBe(true);
+    expect((await profiles.state()).activeProfileId).toBe(bobId);
+
+    await profiles.handle({
+      action: "autoSwitch.set",
+      autoSwitch: { enabled: true, thresholdPercent: 95, continueAfterLimit: false },
+    });
+    profiles.observePlanLimit({ rejected: true }, bobId);
+    await expect(profiles.continuationAfterLimit(bobId)).resolves.toBe(false);
+    // Continuation off still switches; only the refused Turn is left for the user to repeat.
+    expect((await profiles.state()).activeProfileId).toBe(aliceId);
+  });
+
+  it("does not continue a refused Turn when no other account can take over", async () => {
+    const { profiles, signIn } = await setup({ "code-a": alice });
+    const aliceId = defined((await signIn("code-a")).activeProfileId);
+    profiles.observePlanLimit({ rejected: true }, aliceId);
+    await expect(profiles.continuationAfterLimit(aliceId)).resolves.toBe(false);
+    expect((await profiles.state()).activeProfileId).toBe(aliceId);
+  });
+
+  it("logs sign-ins, switches and continuations without emails or tokens", async () => {
+    const { profiles, signIn, log } = await setup({ "code-a": alice, "code-b": bob });
+    await signIn("code-a");
+    const state = await signIn("code-b");
+    const aliceId = defined(state.activeProfileId);
+    const bobId = defined(state.profiles.find((item) => item.email === bob.email)).profileId;
+    profiles.observePlanLimit({ rejected: true }, aliceId);
+    await profiles.continuationAfterLimit(aliceId);
+    const events = log.mock.calls.map(([event]) => event);
+    expect(events).toEqual(
+      expect.arrayContaining([
+        "login.started",
+        "login.completed",
+        "quota.rejected",
+        "autoSwitch.triggered",
+        "account.switched",
+        "continuation.started",
+      ]),
+    );
+    expect(log).toHaveBeenCalledWith("account.switched", {
+      from: aliceId,
+      to: bobId,
+      reason: "auto",
+    });
+    const written = JSON.stringify(log.mock.calls);
+    expect(written).not.toMatch(/example\.com|access-|refresh-|code-a|code-b|https?:/u);
+  });
+
   it("does not switch automatically when disabled", async () => {
     const { profiles, signIn } = await setup({ "code-a": alice, "code-b": bob });
     await signIn("code-a");
     const state = await signIn("code-b");
     await profiles.handle({
       action: "autoSwitch.set",
-      autoSwitch: { enabled: false, thresholdPercent: 95 },
+      autoSwitch: { enabled: false, thresholdPercent: 95, continueAfterLimit: true },
     });
     profiles.observePlanLimit({ sevenDay: { utilizationPercent: 100 } });
     await new Promise((resolve) => setTimeout(resolve, 50));

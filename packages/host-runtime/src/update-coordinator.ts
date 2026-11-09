@@ -17,6 +17,7 @@ import {
   resolveInstalledUpdateContext,
   readRuntimeMetadata,
   selectInstallerReleaseArtifact,
+  selectNpmReleaseArtifacts,
   type BackgroundUpdateManager,
   type BackgroundUpdateStatus,
   type CodexhostLatestRelease,
@@ -108,11 +109,11 @@ export function createHostUpdateCoordinator(
     context: InstalledUpdateContext,
     release: CodexhostLatestRelease,
   ): Promise<boolean> {
-    if (context.installation.kind === "npm") return true;
     const target = context.metadata.target;
-    if (target === "linux-x64" || target === "linux-arm64") return false;
     try {
-      selectInstallerReleaseArtifact(release, target);
+      if (context.installation.kind === "npm") selectNpmReleaseArtifacts(release, target);
+      else if (target === "linux-x64" || target === "linux-arm64") return false;
+      else selectInstallerReleaseArtifact(release, target);
       return true;
     } catch {
       return false;
@@ -233,6 +234,7 @@ export function createHostUpdateCoordinator(
               prepared = await manager.prepareNpm({
                 ...context.installation.options,
                 version: release.version,
+                packages: selectNpmReleaseArtifacts(release, context.metadata.target),
                 onPrepared,
               });
             } else {

@@ -58,8 +58,19 @@ import { createRendererUpdateStatusPoll } from "./update-status-poll.js";
 import { RendererRequestTransportError } from "../renderer-request-sender.js";
 
 export const CODEXHOST_GITHUB_REPOSITORY_URL = "https://github.com/BytePioneer-AI/codex-host";
-export const CODEXHOST_RELEASES_LATEST_URL = `${CODEXHOST_GITHUB_REPOSITORY_URL}/releases/latest`;
-export const CODEXHOST_NPM_MANUAL_UPDATE_COMMAND = "npm install -g @codexhost/cli@latest";
+/** Releases of the repository this build updates from. */
+const CODEXHOST_RELEASES_URL = "https://github.com/Zhang161215/codex-host/releases";
+export const CODEXHOST_RELEASES_LATEST_URL = `${CODEXHOST_RELEASES_URL}/latest`;
+
+/**
+ * Installs a Release's own npm archives: this build is not the `@codexhost/cli` the npm registry
+ * serves. Only Apple silicon macOS and x64 Windows archives are published.
+ */
+function npmManualUpdateCommand(version: string, windows: boolean): string {
+  const download = `${CODEXHOST_RELEASES_URL}/download/v${version}`;
+  const target = windows ? "windows-x64" : "macos-arm64";
+  return `npm install -g ${download}/codexhost-cli-${version}-${target}.tgz ${download}/codexhost-cli-${version}.tgz`;
+}
 
 interface RendererUserAgentData {
   readonly platform?: string;
@@ -83,7 +94,7 @@ function windowsInstallerDownloadUrl(window: Window | null | undefined, version:
   const hints = navigator ? rendererUserAgentData(navigator) : undefined;
   const identity = `${hints?.architecture ?? ""} ${hints?.platform ?? ""} ${navigator?.platform ?? ""} ${navigator?.userAgent ?? ""}`;
   const architecture = /arm64|aarch64|\barm\b/iu.test(identity) ? "arm64" : "x64";
-  return `https://github.com/BytePioneer-AI/codex-host/releases/download/v${version}/codexhost-${version}-windows-${architecture}.exe`;
+  return `${CODEXHOST_RELEASES_URL}/download/v${version}/codexhost-${version}-windows-${architecture}.exe`;
 }
 
 export const DEFAULT_RENDERER_SETTINGS_PAGE_IDS = [
@@ -344,7 +355,7 @@ function updatesPage(
       const manualNpmCommandRow = document.createElement("div");
       manualNpmCommandRow.className = "settings-update-command";
       const manualNpmCommand = document.createElement("code");
-      manualNpmCommand.textContent = CODEXHOST_NPM_MANUAL_UPDATE_COMMAND;
+      manualNpmCommand.textContent = "";
       const copyCommand = document.createElement("button");
       copyCommand.type = "button";
       copyCommand.className = "settings-update-command__copy";
@@ -362,7 +373,7 @@ function updatesPage(
           restore(messages.updateCopyFailed);
           return;
         }
-        void clipboard.writeText(CODEXHOST_NPM_MANUAL_UPDATE_COMMAND).then(
+        void clipboard.writeText(manualNpmCommand.textContent ?? "").then(
           () => restore(messages.updateCommandCopied),
           () => restore(messages.updateCopyFailed),
         );
@@ -573,7 +584,10 @@ function updatesPage(
           ? "settings-update-metadata__value--newer"
           : "";
         installationValue.textContent = installationLabel(result.installation, messages);
-        manualNpm.hidden = result.installation !== "npm";
+        manualNpm.hidden = result.installation !== "npm" || !result.latestVersion;
+        if (result.latestVersion) {
+          manualNpmCommand.textContent = npmManualUpdateCommand(result.latestVersion, windows);
+        }
         manualWindowsInstaller.hidden = !windows || result.installation !== "windows-installer";
         releaseLink.hidden = windows;
         manualTitle.hidden =

@@ -8,13 +8,14 @@ import {
   fetchLatestGitHubReleaseWithGitHubCli,
   parseLatestGitHubRelease,
   selectInstallerReleaseArtifact,
+  selectNpmReleaseArtifacts,
   type GitHubCliRunner,
 } from "@codexhost/update-manager";
 
 function release(overrides: Record<string, unknown> = {}) {
   return {
     tag_name: "v1.2.3",
-    html_url: "https://github.com/BytePioneer-AI/codex-host/releases/tag/v1.2.3",
+    html_url: "https://github.com/Zhang161215/codex-host/releases/tag/v1.2.3",
     draft: false,
     prerelease: false,
     body: "## Changes\n\n- Safer updates",
@@ -24,7 +25,7 @@ function release(overrides: Record<string, unknown> = {}) {
         size: 42,
         digest: `sha256:${"ab".repeat(32)}`,
         browser_download_url:
-          "https://github.com/BytePioneer-AI/codex-host/releases/download/v1.2.3/codexhost-1.2.3-windows-x64.exe",
+          "https://github.com/Zhang161215/codex-host/releases/download/v1.2.3/codexhost-1.2.3-windows-x64.exe",
         uploader: { login: "github-actions" },
       },
     ],
@@ -41,7 +42,7 @@ describe("GitHub Release update discovery", () => {
     expect(selectInstallerReleaseArtifact(parsed, "windows-x64")).toEqual({
       name: "codexhost-1.2.3-windows-x64.exe",
       source: {
-        url: "https://github.com/BytePioneer-AI/codex-host/releases/download/v1.2.3/codexhost-1.2.3-windows-x64.exe",
+        url: "https://github.com/Zhang161215/codex-host/releases/download/v1.2.3/codexhost-1.2.3-windows-x64.exe",
         sha256: "ab".repeat(32),
         size: 42,
       },
@@ -51,12 +52,45 @@ describe("GitHub Release update discovery", () => {
     );
   });
 
+  it("selects this fork's npm archives and rejects upstream Releases", () => {
+    const version = "0.18.0-beta.3.claude.5";
+    const asset = (name: string) => ({
+      name,
+      size: 42,
+      digest: `sha256:${"cd".repeat(32)}`,
+      browser_download_url: `https://github.com/Zhang161215/codex-host/releases/download/v${version}/${name}`,
+    });
+    const parsed = parseLatestGitHubRelease(
+      release({
+        tag_name: `v${version}`,
+        html_url: `https://github.com/Zhang161215/codex-host/releases/tag/v${version}`,
+        assets: [
+          asset(`codexhost-cli-${version}-windows-x64.tgz`),
+          asset(`codexhost-cli-${version}.tgz`),
+        ],
+      }),
+    );
+    expect(selectNpmReleaseArtifacts(parsed, "windows-x64").map(({ name }) => name)).toEqual([
+      `codexhost-cli-${version}-windows-x64.tgz`,
+      `codexhost-cli-${version}.tgz`,
+    ]);
+    expect(() => selectNpmReleaseArtifacts(parsed, "macos-arm64")).toThrow("exactly one");
+    expect(CODEXHOST_LATEST_RELEASE_URL).toBe(
+      "https://api.github.com/repos/Zhang161215/codex-host/releases/latest",
+    );
+    expect(() =>
+      parseLatestGitHubRelease(
+        release({ html_url: "https://github.com/BytePioneer-AI/codex-host/releases/tag/v1.2.3" }),
+      ),
+    ).toThrow();
+  });
+
   it("rejects prereleases, mismatched notes, duplicate assets, and unverified selection", () => {
     expect(() => parseLatestGitHubRelease(release({ prerelease: true }))).toThrow("invalid");
     expect(() =>
       parseLatestGitHubRelease(
         release({
-          html_url: "https://github.com/BytePioneer-AI/codex-host/releases/tag/v9.9.9",
+          html_url: "https://github.com/Zhang161215/codex-host/releases/tag/v9.9.9",
         }),
       ),
     ).toThrow("does not match");
@@ -67,7 +101,7 @@ describe("GitHub Release update discovery", () => {
             name: "codexhost-1.2.3-windows-x64.exe",
             size: 42,
             browser_download_url:
-              "https://github.com/BytePioneer-AI/codex-host/releases/download/v1.2.3/codexhost-1.2.3-windows-x64.exe",
+              "https://github.com/Zhang161215/codex-host/releases/download/v1.2.3/codexhost-1.2.3-windows-x64.exe",
           },
         ],
       }),
@@ -135,7 +169,7 @@ describe("GitHub Release update discovery", () => {
         "Accept: application/vnd.github+json",
         "--header",
         "X-GitHub-Api-Version: 2022-11-28",
-        "repos/BytePioneer-AI/codex-host/releases/latest",
+        "repos/Zhang161215/codex-host/releases/latest",
       ],
       { environment: { PATH: "/usr/bin:/bin" } },
     );

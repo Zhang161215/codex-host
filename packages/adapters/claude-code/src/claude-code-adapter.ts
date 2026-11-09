@@ -58,6 +58,7 @@ import {
   type TurnCancelCommand,
   type TurnOutcome,
   type TurnStartAccepted,
+  type HostTextInput,
   type TurnStartCommand,
   type TurnSteerAccepted,
   type TurnSteerCommand,
@@ -114,6 +115,7 @@ import {
   ClaudeAccountProfiles,
   type ClaudeProfileSpawnEnvironment,
 } from "./account-profiles/manager.js";
+import { writeClaudeAccountLog } from "./account-profiles/log.js";
 import type { ClaudeThreadSignIn } from "./account-profiles/threads.js";
 import {
   CLAUDE_DEFAULT_THINKING_OPTION_ID,
@@ -331,6 +333,10 @@ function parseClaudeHarnessCommand(
 const DEFAULT_CLOSE_TIMEOUT_MS = 7_000;
 /** The plan-window key for Threads under Claude Code's own login. */
 const NATIVE_PLAN_ACCOUNT = "native";
+/** What a Thread sends on the next account after Claude refused a Turn for its account's limit. */
+const LIMIT_CONTINUATION_TEXT = "继续";
+/** Continuations allowed between two user messages, so a run of exhausted accounts ends. */
+const MAX_LIMIT_CONTINUATIONS = 3;
 const DEFAULT_CANCEL_TIMEOUT_MS = 2_000;
 const DEFAULT_TOOL_OUTPUT_LIMIT = 64_000;
 const CONTEXT_USAGE_RETRY_DELAYS_MS = [0, 1_000, 2_000] as const;
@@ -628,6 +634,11 @@ class ClaudeHarnessSession implements HarnessSession {
   /** The sign-in the running native process started with. */
   #transportSignIn: ClaudeProfileSpawnEnvironment | null = null;
   readonly #onSignInRejected: ((profileId: string) => void) | null;
+  readonly #continueAfterLimit: ((profileId: string | null) => Promise<boolean>) | null;
+  /** The Turn during which Claude refused a request because the account reached its limit. */
+  #limitRejectedTurn: ActiveTurn | null = null;
+  /** Continuations started since the user's last message. */
+  #limitContinuations = 0;
   readonly #randomUUID: () => string;
   #requestedModel: HarnessModelRef | undefined;
   #requestedPermissionModeId: HarnessPermissionModeId;
@@ -684,6 +695,11 @@ class ClaudeHarnessSession implements HarnessSession {
       resolveSignIn?: () => Promise<ClaudeProfileSpawnEnvironment | null>;
       /** Told when Claude refuses the saved sign-in a Turn ran under. */
       onSignInRejected?: (profileId: string) => void;
+      /**
+       * Asked once Claude refused a Turn because the sign-in it ran under (null for Claude Code's
+       * own login) reached its limit: true when the work should continue on the account now active.
+       */
+      continueAfterLimit?: (profileId: string | null) => Promise<boolean>;
       bypassPermissionsAvailable: boolean;
       openMode: "create" | "resume";
       sessionId: string;
@@ -722,6 +738,7 @@ class ClaudeHarnessSession implements HarnessSession {
     this.#sessionEnvironment = environment ?? options.baseEnvironment;
     this.#resolveSignIn = options.resolveSignIn ?? null;
     this.#onSignInRejected = options.onSignInRejected ?? null;
+    this.#continueAfterLimit = options.continueAfterLimit ?? null;
     this.#bypassPermissionsAvailable = options.bypassPermissionsAvailable;
     this.#randomUUID = dependencies.randomUUID;
     this.#readSessionMessages = dependencies.readSessionMessages;
@@ -1022,6 +1039,7 @@ class ClaudeHarnessSession implements HarnessSession {
     };
     this.#active = active;
     this.#submittedInput = true;
+    this.#limitContinuations = 0;
     this.#event({ type: "turn.started", turnId: command.turnId });
     this.#event({ type: "item.started", turnId: command.turnId, item });
     try {
@@ -1227,6 +1245,7 @@ class ClaudeHarnessSession implements HarnessSession {
     };
     this.#active = active;
     this.#submittedInput = true;
+    this.#limitContinuations = 0;
     this.#event({ type: "turn.started", turnId: command.turnId });
     if (item) this.#event({ type: "item.started", turnId: command.turnId, item });
     const running =
@@ -1829,6 +1848,10 @@ class ClaudeHarnessSession implements HarnessSession {
       return current;
     }
     if (this.#transport !== current) return this.#transport ?? this.#startTransport(signIn);
+    writeClaudeAccountLog("thread.restarted", {
+      from: this.#transportSignIn?.profileId ?? null,
+      to: signIn?.profileId ?? null,
+    });
     await current.close();
     if (this.#transport === current) this.#transport = null;
     this.#openMode = "resume";
@@ -2406,7 +2429,11 @@ class ClaudeHarnessSession implements HarnessSession {
    * it; otherwise it becomes a live autonomous Turn, so the Thread shows it running and a new
    * request waits instead of absorbing it.
    */
-  #startAutonomousTurn(segmentKey: string, userMessageId: string | null): ActiveTurn | null {
+  #startAutonomousTurn(
+    segmentKey: string,
+    userMessageId: string | null,
+    input: HostTextInput[] = [],
+  ): ActiveTurn | null {
     if (this.#phase !== "open") return null;
     const current = this.#active;
     if (current?.held) return current;
@@ -2425,7 +2452,7 @@ class ClaudeHarnessSession implements HarnessSession {
       text: "",
     };
     const active: ActiveTurn = {
-      command: { type: "turn.start", turnId, input: [] },
+      command: { type: "turn.start", turnId, input },
       compactionItem: null,
       steersAwaitingNative: new Set(),
       item,
@@ -2478,7 +2505,7 @@ class ClaudeHarnessSession implements HarnessSession {
       resolveCompletion,
     };
     this.#active = active;
-    this.#event({ type: "turn.autonomous.started", turnId, input: [] });
+    this.#event({ type: "turn.autonomous.started", turnId, input });
     this.#event({ type: "turn.started", turnId });
     this.#event({ type: "item.started", turnId, item });
     return active;
@@ -2550,6 +2577,8 @@ class ClaudeHarnessSession implements HarnessSession {
     // A late native terminal cannot substitute for the process shutdown already in progress.
     if (this.#active !== active || this.#hardCancelTask) return;
     active.rootSegmentActive = false;
+    const limited = this.#limitRejectedTurn === active;
+    if (limited) this.#limitRejectedTurn = null;
     if (active.cancellation) {
       // The Turn ends only once its background work is confirmed stopped; later Segments
       // still reach it through the idle handler. An unproven interruption still fails it.
@@ -2575,10 +2604,65 @@ class ClaudeHarnessSession implements HarnessSession {
     } else if (result.status === "cancelled") {
       this.#finish(active, { status: "cancelled", reason: result.reason });
     } else {
-      const profileId = this.#transportSignIn?.profileId;
+      const profileId = this.#transportSignIn?.profileId ?? null;
       if (result.kind === "authentication" && profileId) this.#onSignInRejected?.(profileId);
       this.#finishFailed(active, transportFailure(result.kind));
+      if (limited) void this.#continueOnNextAccount(profileId);
     }
+  }
+
+  /**
+   * Claude refused the last Turn because its account reached the limit. Once the switch it caused
+   * has moved to another account, the same native Session resumes under that account and a new
+   * Turn continues the work, so the user does not have to ask again.
+   */
+  async #continueOnNextAccount(origin: string | null): Promise<void> {
+    const decide = this.#continueAfterLimit;
+    if (!decide || this.#limitContinuations >= MAX_LIMIT_CONTINUATIONS) return;
+    if (!(await decide(origin).catch(() => false)) || !this.#continuationAllowed()) return;
+    this.#acceptingTurn = true;
+    let transport: ClaudeTurnTransport;
+    try {
+      transport = await this.#ensureTransport();
+    } catch {
+      return;
+    } finally {
+      this.#acceptingTurn = false;
+    }
+    // Work still running keeps the refused account's process; the user's next Turn moves it.
+    if (!this.#continuationAllowed() || (this.#transportSignIn?.profileId ?? null) === origin) {
+      return;
+    }
+    this.#limitContinuations += 1;
+    const nativeTurnKey = this.#randomUUID();
+    const active = this.#startAutonomousTurn(nativeTurnKey, nativeTurnKey, [
+      { type: "text", text: LIMIT_CONTINUATION_TEXT },
+    ]);
+    if (!active) return;
+    this.#usageGeneration += 1;
+    this.#contextUsageFreshUntilMs = 0;
+    this.#contextUsageCooldownUntilMs = 0;
+    try {
+      const running = transport.runTurn(LIMIT_CONTINUATION_TEXT, nativeTurnKey, (event) => {
+        this.#handleTurnEvent(active, event);
+      });
+      void running.then(
+        (result) => this.#finishResult(active, result),
+        () => this.#handleTurnTransportFailure(active),
+      );
+    } catch {
+      this.#finishFailed(active, faultError());
+    }
+  }
+
+  #continuationAllowed(): boolean {
+    return (
+      this.#phase === "open" &&
+      this.#active === null &&
+      !this.#acceptingTurn &&
+      this.#configurationTask === null &&
+      !this.#readingHistory
+    );
   }
 
   #requestContextUsage(
@@ -2804,6 +2888,7 @@ class ClaudeHarnessSession implements HarnessSession {
    * Thread's Usage popover showing a number the credits pill disagrees with.
    */
   #handlePlanLimit(planLimit: ClaudePlanLimitEvent): void {
+    if (planLimit.rejected && this.#active) this.#limitRejectedTurn = this.#active;
     const effective = this.#onPlanLimitObserved(planLimit);
     if (effective) this.publishPlanLimit(effective);
   }
@@ -3654,6 +3739,8 @@ export class ClaudeCodeAdapter implements HarnessAdapter {
               resolveSignIn: () => this.#profiles?.spawnEnvironment() ?? Promise.resolve(null),
               onSignInRejected: (profileId: string) =>
                 this.#profiles?.reportAuthenticationFailure(profileId),
+              continueAfterLimit: (profileId: string | null) =>
+                this.#profiles?.continuationAfterLimit(profileId) ?? Promise.resolve(false),
             }
           : {}),
         bypassPermissionsAvailable,

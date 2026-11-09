@@ -168,6 +168,7 @@ mod tests {
                 npm_cli_path: wrong_executable.clone(),
                 npm_launcher_path: wrong_executable,
                 npm_package_root: directory.clone(),
+                packages: Vec::new(),
             }),
         };
         let error = wait_for_launcher_exit(&request).unwrap_err();

@@ -157,6 +157,8 @@ npm 的 Launcher 和 Node 分别来自更新请求的平台包根目录与 `node
 
 停止服务后安装或启动失败时，Updater 尝试一次恢复同一安装，更新状态保持失败并附带恢复结果；不保证损坏的安装可以回滚。会话记录保留，被中断任务不自动继续。浏览器在更新期间断线时有界重试状态查询，不重发开始更新；10 分钟内无法确认结果时显示未知，不推断安装失败。
 
+本分支（Claude 多账号版）的更新只查 `Zhang161215/codex-host` 的最新正式 Release（预发布和草稿不算），不查上游。npm 安装从该 Release 取本平台包 `codexhost-cli-<版本>-<目标>.tgz` 和主包 `codexhost-cli-<版本>.tgz`，按 GitHub 给出的 SHA-256 下载校验后放进本次更新目录，Updater 再次校验后执行 `npm install --global <两个 tgz>`，不从 npm 仓库解析 `@codexhost/cli`，因此不会被上游版本覆盖；Release 缺这两个文件时不提供一键更新。更新页的手动命令也是这两个文件的下载地址。目前只发布 Apple 芯片 macOS 与 x64 Windows；Windows 包里的 Updater 由本分支交叉编译（`x86_64-pc-windows-gnu`）。
+
 `codexhost update` 提供不打开浏览器的终端入口，适用于 npm、macOS DMG 和 Windows 安装包。命令检查最新 Release，已是最新版本时成功退出。有可用 Host 时，验证它属于当前安装后复用 Host 的更新接口；不同安装或缺少安装身份的旧 Host 会被明确拒绝。终端显示请求已接受不代表安装已经完成，应查看重连后的更新状态和当前版本。
 
 没有可用 Host 时，Console/CLI 使用独立更新流程，下载、准备后等待 Updater 校验进程身份并确认就绪，转移更新锁，再退出；Updater 等发起进程退出后安装。没有安装 Desktop 时恢复 Web，否则沿用 Desktop 启动方式。创建子进程或获得 PID 不代表交接成功；启动报错、提前退出或交接超时都会报告失败。源码构建和 Linux 非 npm 安装不支持自更新。

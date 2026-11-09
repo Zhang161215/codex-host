@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -18,12 +19,25 @@ afterEach(async () => {
   await rm(root, { recursive: true, force: true });
 });
 
+const NPM_ARCHIVE = Buffer.from("npm-archive-fixture");
+const NPM_ARCHIVE_SHA256 = createHash("sha256").update(NPM_ARCHIVE).digest("hex");
+
 const release = {
   version: "1.1.0",
   releaseNotes: "Fixes",
-  releaseNotesUrl: "https://github.com/BytePioneer-AI/codex-host/releases/tag/v1.1.0",
-  assets: [],
+  releaseNotesUrl: "https://github.com/Zhang161215/codex-host/releases/tag/v1.1.0",
+  assets: ["codexhost-cli-1.1.0-linux-x64.tgz", "codexhost-cli-1.1.0.tgz"].map((name) => ({
+    name,
+    size: NPM_ARCHIVE.length,
+    digest: `sha256:${NPM_ARCHIVE_SHA256}`,
+    downloadUrl: `https://github.com/Zhang161215/codex-host/releases/download/v1.1.0/${name}`,
+  })),
 };
+
+async function downloadNpmArchive(_source: unknown, destination: string) {
+  await writeFile(destination, NPM_ARCHIVE, { flag: "wx", mode: 0o600 });
+  return { bytes: NPM_ARCHIVE.length, finalUrl: "https://downloads.example.test/final" };
+}
 
 async function npmLayout(platform: NodeJS.Platform = process.platform) {
   const packageRoot = path.join(root, "package");
@@ -202,7 +216,11 @@ describe("console updates", () => {
       processExecutable: process.execPath,
       stateDirectory: path.join(root, "state"),
       fetchLatest: async () => release,
-      manager: createBackgroundUpdateManager({ platform: "linux", spawnUpdater }),
+      manager: createBackgroundUpdateManager({
+        platform: "linux",
+        spawnUpdater,
+        download: downloadNpmArchive,
+      }),
     });
 
     await updates.check(target);
@@ -230,6 +248,13 @@ describe("console updates", () => {
       runtime_descriptor_path: target.runtimeDescriptorPath,
       data_directory: target.dataDirectory,
       restart_target: "web",
+      installation: {
+        kind: "npm",
+        packages: [
+          { path: expect.stringMatching(/npm-package-1\.tgz$/u), sha256: NPM_ARCHIVE_SHA256 },
+          { path: expect.stringMatching(/npm-package-2\.tgz$/u), sha256: NPM_ARCHIVE_SHA256 },
+        ],
+      },
     });
     expect(
       JSON.parse(await readFile(path.join(root, "state", "active-update-v1.lock"), "utf8")),
@@ -253,6 +278,7 @@ describe("console updates", () => {
       manager: createBackgroundUpdateManager({
         platform: "linux",
         spawnUpdater,
+        download: downloadNpmArchive,
       }),
     });
     await expect(updates.start(target)).rejects.toThrow();
@@ -285,6 +311,7 @@ describe("console updates", () => {
       fetchLatest: async () => release,
       manager: createBackgroundUpdateManager({
         platform: "linux",
+        download: downloadNpmArchive,
         spawnUpdater: () => {
           queueMicrotask(() => child.emit(event, new Error("spawn failed")));
           return child as never;

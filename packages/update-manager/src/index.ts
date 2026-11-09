@@ -20,6 +20,7 @@ export {
   fetchLatestGitHubRelease,
   parseLatestGitHubRelease,
   selectInstallerReleaseArtifact,
+  selectNpmReleaseArtifacts,
   type CodexhostLatestRelease,
   type CodexhostReleaseAsset,
   type GitHubReleaseFetchOptions,

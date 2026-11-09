@@ -109,6 +109,25 @@ export function claudeAuthorizeUrl(pkce: ClaudePkce, port: number | null): strin
   return url.toString();
 }
 
+/**
+ * The OAuth error code of a refused request (`invalid_grant`, `invalid_scope`, ...). Only a short
+ * code is kept: descriptions may quote request values, and error text reaches logs and the UI.
+ */
+async function errorCode(response: Response): Promise<string | undefined> {
+  try {
+    const body: unknown = await response.json();
+    const value =
+      isRecord(body) && typeof body.error === "string"
+        ? body.error
+        : isRecord(body) && isRecord(body.error) && typeof body.error.type === "string"
+          ? body.error.type
+          : undefined;
+    return value && /^[a-z0-9_.-]{1,64}$/iu.test(value) ? value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 async function request(
   fetchImpl: FetchLike,
   url: string,
@@ -124,8 +143,9 @@ async function request(
   if (!response.ok) {
     const revoked =
       (response.status === 400 || response.status === 401) && url === CLAUDE_OAUTH.tokenUrl;
+    const reason = await errorCode(response);
     throw new ClaudeOAuthError(
-      `${action} failed (HTTP ${response.status})`,
+      `${action} failed (HTTP ${response.status}${reason ? `: ${reason}` : ""})`,
       response.status,
       revoked,
     );

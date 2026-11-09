@@ -34,12 +34,16 @@ export interface StoredClaudeSwitch {
 export interface StoredClaudeProfiles {
   version: 1;
   activeProfileId: string | null;
-  autoSwitch: { enabled: boolean; thresholdPercent: number };
+  autoSwitch: { enabled: boolean; thresholdPercent: number; continueAfterLimit: boolean };
   profiles: StoredClaudeProfile[];
   lastSwitch: StoredClaudeSwitch | null;
 }
 
-export const DEFAULT_AUTO_SWITCH = Object.freeze({ enabled: true, thresholdPercent: 95 });
+export const DEFAULT_AUTO_SWITCH = Object.freeze({
+  enabled: true,
+  thresholdPercent: 95,
+  continueAfterLimit: true,
+});
 
 function emptyProfiles(): StoredClaudeProfiles {
   return {

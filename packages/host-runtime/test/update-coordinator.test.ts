@@ -138,12 +138,32 @@ async function macFixture(): Promise<{
   return { root, hostRuntimePath, environment };
 }
 
-function release(version = "1.2.3"): CodexhostLatestRelease {
+const NPM_ARCHIVE = Buffer.from("npm-archive-fixture");
+
+/** The fork's npm archives for every target, all carrying the same fixture bytes. */
+function npmAssets(version: string): CodexhostLatestRelease["assets"] {
+  return ["macos-arm64", "windows-x64", "linux-x64", null].map((target) => {
+    const name = target ? `codexhost-cli-${version}-${target}.tgz` : `codexhost-cli-${version}.tgz`;
+    return {
+      name,
+      size: NPM_ARCHIVE.length,
+      digest: `sha256:${digest(NPM_ARCHIVE)}`,
+      downloadUrl: `https://github.com/Zhang161215/codex-host/releases/download/v${version}/${name}`,
+    };
+  });
+}
+
+async function downloadNpmArchive(_source: unknown, destination: string) {
+  await writeFile(destination, NPM_ARCHIVE, { flag: "wx", mode: 0o600 });
+  return { bytes: NPM_ARCHIVE.length, finalUrl: "https://downloads.example.test/final" };
+}
+
+function release(version = "1.2.3", assets = npmAssets(version)): CodexhostLatestRelease {
   return {
     version,
     releaseNotes: `Release ${version}`,
-    releaseNotesUrl: `https://github.com/BytePioneer-AI/codex-host/releases/tag/v${version}`,
-    assets: [],
+    releaseNotesUrl: `https://github.com/Zhang161215/codex-host/releases/tag/v${version}`,
+    assets,
   };
 }
 
@@ -159,7 +179,11 @@ describe("Host update coordinator", () => {
       };
       delete environment.CODEXHOST_CONTROL_PORT;
       delete environment.CODEXHOST_CONTROL_NONCE;
-      const actual = createBackgroundUpdateManager({ platform, randomId: () => "service" });
+      const actual = createBackgroundUpdateManager({
+        platform,
+        randomId: () => "service",
+        download: downloadNpmArchive,
+      });
       const manager = {
         ...actual,
         prepareNpm: vi.fn(actual.prepareNpm),
@@ -188,6 +212,19 @@ describe("Host update coordinator", () => {
           restart_target: "web",
           data_directory: environment.CODEXHOST_DATA_DIR,
           wait_pid: 4321,
+          installation: {
+            kind: "npm",
+            packages: [
+              {
+                path: path.join(state, "update-1.2.3-service", "npm-package-1.tgz"),
+                sha256: digest(NPM_ARCHIVE),
+              },
+              {
+                path: path.join(state, "update-1.2.3-service", "npm-package-2.tgz"),
+                sha256: digest(NPM_ARCHIVE),
+              },
+            ],
+          },
         });
       });
       expect(manager.prepareNpm).toHaveBeenCalledOnce();
@@ -221,6 +258,21 @@ describe("Host update coordinator", () => {
     },
   );
 
+  it("does not offer an npm update from a Release without this build's npm archives", async () => {
+    const fixture = await npmFixture();
+    const coordinator = createHostUpdateCoordinator({
+      ...fixture,
+      platform: "darwin",
+      architecture: "arm64",
+      fetchLatest: async () => release("1.2.3", []),
+    });
+    await expect(coordinator.check()).resolves.toMatchObject({
+      latestVersion: "1.2.3",
+      updateAvailable: true,
+      installationAvailable: false,
+    });
+  });
+
   it("does not fall back after caller cancellation", async () => {
     const fixture = await npmFixture();
     const controller = new AbortController();
@@ -247,6 +299,7 @@ describe("Host update coordinator", () => {
       platform: "darwin",
       randomId: () => "one",
       spawnUpdater,
+      download: downloadNpmArchive,
       now: () => 10_000,
     });
     const coordinator = createHostUpdateCoordinator({
@@ -268,9 +321,11 @@ describe("Host update coordinator", () => {
     await expect(coordinator.start()).resolves.toMatchObject({
       status: { version: "1.2.3", installation: "npm", phase: "prepared" },
     });
-    await expect(coordinator.start()).resolves.toMatchObject({
-      status: { version: "1.2.3", phase: "prepared" },
-    });
+    // A repeated start joins the operation while its npm archives download.
+    await expect(coordinator.start()).resolves.toMatchObject({ status: { version: "1.2.3" } });
+    await vi.waitFor(async () =>
+      expect((await coordinator.status()).status).toMatchObject({ phase: "prepared" }),
+    );
     const home = fixture.environment.HOME;
     if (!home) throw new Error("fixture HOME is missing");
     const updaterRequestPath = path.join(
@@ -295,6 +350,7 @@ describe("Host update coordinator", () => {
       platform: "win32",
       randomId: () => "one",
       spawnUpdater,
+      download: downloadNpmArchive,
       now: () => 10_000,
     });
     const coordinator = createHostUpdateCoordinator({
@@ -354,14 +410,14 @@ describe("Host update coordinator", () => {
       fetchLatest: async () => ({
         version: "1.2.3",
         releaseNotes: "Release 1.2.3",
-        releaseNotesUrl: "https://github.com/BytePioneer-AI/codex-host/releases/tag/v1.2.3",
+        releaseNotesUrl: "https://github.com/Zhang161215/codex-host/releases/tag/v1.2.3",
         assets: [
           {
             name: "codexhost-1.2.3-macos-arm64.dmg",
             size: bytes.length,
             digest: `sha256:${digest(bytes)}`,
             downloadUrl:
-              "https://github.com/BytePioneer-AI/codex-host/releases/download/v1.2.3/codexhost-1.2.3-macos-arm64.dmg",
+              "https://github.com/Zhang161215/codex-host/releases/download/v1.2.3/codexhost-1.2.3-macos-arm64.dmg",
           },
         ],
       }),

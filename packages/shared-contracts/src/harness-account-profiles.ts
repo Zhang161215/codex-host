@@ -48,6 +48,11 @@ export const harnessAccountAutoSwitchSchema = z
     enabled: z.boolean(),
     /** Switch away once the 5-hour or 7-day window of the active profile reaches this. */
     thresholdPercent: z.number().int().min(50).max(100),
+    /**
+     * When Claude refuses a reply because the account hit its limit and the switch found another
+     * account, the Thread continues the interrupted work under it.
+     */
+    continueAfterLimit: z.boolean(),
   })
   .strict();
 export type HarnessAccountAutoSwitch = z.infer<typeof harnessAccountAutoSwitchSchema>;

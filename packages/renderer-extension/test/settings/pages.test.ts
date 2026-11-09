@@ -222,7 +222,7 @@ function updateCheck(status: UpdateStatus | null = null): UpdateCheckResult {
     updateAvailable: true,
     installationAvailable: true,
     releaseNotes: "Safer updates",
-    releaseNotesUrl: "https://github.com/BytePioneer-AI/codex-host/releases/tag/v1.2.3",
+    releaseNotesUrl: "https://github.com/Zhang161215/codex-host/releases/tag/v1.2.3",
     status,
     error: null,
   };
@@ -2653,7 +2653,7 @@ describe("Renderer Updates page", () => {
 
     await vi.waitFor(() => {
       expect(releaseLink.href).toBe(
-        "https://github.com/BytePioneer-AI/codex-host/releases/tag/v1.2.3",
+        "https://github.com/Zhang161215/codex-host/releases/tag/v1.2.3",
       );
     });
 
@@ -2666,9 +2666,7 @@ describe("Renderer Updates page", () => {
       expect(panel.dataset.updateState).toBe("failed");
     });
     expect(descendants(content)).toContain(releaseLink);
-    expect(releaseLink.href).toBe(
-      "https://github.com/BytePioneer-AI/codex-host/releases/tag/v1.2.3",
-    );
+    expect(releaseLink.href).toBe("https://github.com/Zhang161215/codex-host/releases/tag/v1.2.3");
 
     cleanup?.();
     scope.dispose();
@@ -2755,13 +2753,15 @@ describe("Renderer Updates page", () => {
       );
       expect(update).toBeDefined();
       if (installation === "npm") {
-        expect(visibleText(content)).toContain("npm install -g @codexhost/cli@latest");
+        expect(visibleText(content)).toContain(
+          "npm install -g https://github.com/Zhang161215/codex-host/releases/download/v1.2.3/codexhost-cli-1.2.3-windows-x64.tgz https://github.com/Zhang161215/codex-host/releases/download/v1.2.3/codexhost-cli-1.2.3.tgz",
+        );
       } else {
         const link = descendants(content).find(
           ({ tagName, href }) =>
             tagName === "a" &&
             href ===
-              "https://github.com/BytePioneer-AI/codex-host/releases/download/v1.2.3/codexhost-1.2.3-windows-x64.exe",
+              "https://github.com/Zhang161215/codex-host/releases/download/v1.2.3/codexhost-1.2.3-windows-x64.exe",
         );
         expect(link).toMatchObject({ target: "_blank", rel: "noopener noreferrer" });
       }
