@@ -42,13 +42,14 @@ codexhost 可以保存多个 Claude 订阅登录，让 Claude Code Thread 在其
 
 ## 登录与保存
 
-- 添加账号走与 `claude setup-token` 相同的长效登录：OAuth PKCE 授权（`claude.com/cai/oauth/authorize`），scope 只申请 `user:inference user:profile`，换 token（`platform.claude.com/v1/oauth/token`）时带 `expires_in: 31536000`，得到一年有效、无需刷新的 access token。token 端点只对部分 scope 接受自定义有效期（`user:mcp_servers` 会被拒绝），所以不申请 Claude Code 交互登录的完整 scope；`user:profile` 保留资料与额度接口。通过 `CLAUDE_CODE_OAUTH_TOKEN` 传入时 Claude Code 本来就只按推理权限使用它。
+- 添加账号走与 `claude setup-token` 完全相同的长效登录：OAuth PKCE 授权（`claude.com/cai/oauth/authorize`），scope 只申请 `user:inference`，换 token（`platform.claude.com/v1/oauth/token`）时带 `expires_in: 31536000`，得到一年有效、无需刷新的 access token（Claude Code 2.1.321 源码：`setup-token` 即 `inferenceOnly` + `expiresIn: 31536000`）。多申请任何 scope 都拿不到一年期：2026-11 前的版本申请了 `user:inference user:profile`，实际得到的是普通可刷新登录，refresh token 约 30 天后到期，设置页随即提示“到期，请重新登录”；这类账号用新版重新登录一次即换成一年期。
+- 只有推理权限的 token 不能调资料与额度接口（Claude Code 自己也只在有 `user:profile` 时才查额度），Adapter 对这类 token 不发这两个请求：账号名取换 token 响应里的邮箱，套餐若响应里没有就不显示、也不传 `CLAUDE_CODE_SUBSCRIPTION_TYPE`（同一账号以前保存过的套餐保留）；额度在账号运行后由 `rate_limit_event` 写入，自动切换按最近一次看到的额度排序，从未运行过的账号按 50% 计。
 - 普通登录的 refresh token 有约 29 天的绝对期限，刷新不能延长，所以长效 token 比“定期刷新”更省事：一年内不需要重新登录，也不存在两边轮换 refresh token 互相顶掉的问题。
-- 换 token 的响应自带账号 `email_address` / `uuid` 与组织 `uuid`；资料接口再补上订阅类型，资料接口失败时只用前者。同一账号（`account.uuid` + `organization.uuid`）重复登录只更新已有记录，不新增条目。第一个账号自动成为当前账号。
+- 换 token 的响应自带账号 `email_address` / `uuid` 与组织 `uuid`；token 有 `user:profile` 时资料接口再补上订阅类型，资料接口失败时只用前者。同一账号（`account.uuid` + `organization.uuid`）重复登录只更新已有记录，不新增条目。第一个账号自动成为当前账号。
 - 与 Claude Code 一样，一次登录同时给出两个链接，共用同一对 PKCE 与 `state`：“打开登录页”走 `http://localhost:<随机端口>/callback`，Adapter 在 `127.0.0.1` 与 `::1` 的同一端口上监听，回调成功后跳转官方成功页；“复制登录链接”走官方授权码页（`platform.claude.com/oauth/code/callback`），可在任意浏览器或其他设备打开，登录后把页面上的 `code#state` 粘贴回设置页。粘贴的若是本机回调链接，则按回调地址换 token；`state` 不匹配会拒绝。复制失败时显示链接供手动复制。登录面板每次登录只构建一次，轮询不会清掉正在粘贴的内容。
 - 同一个输入框也接受已有的 `sk-ant-oat…` token（例如 `claude setup-token` 的输出，`token.add` 动作）。这类 token 只有推理权限，读不到资料和额度：名称显示为 `Claude (…末四位)`，有效期未知，额度在它作为当前账号运行后由 `rate_limit_event` 写入，资料或额度接口返回 403 不算错误。
 - 所有平台同一种存储：元数据在 `<CODEXHOST_DATA_DIR 或 ~/.codexhost>/claude-accounts/profiles.json`，token 在同目录 `secrets/<profileId>.json`。macOS/Linux 为 0600；Windows 继承用户目录 ACL，与 Claude Code 自己在 Windows 上的 `.credentials.json` 保护方式一致。写入用临时文件加替换，Windows 上替换遇到 `EPERM`/`EBUSY`/`EACCES` 短暂重试。整个 `claude-accounts` 目录可以直接拷到另一台机器使用。
-- 长效 token 不刷新：过期或被 Claude 拒绝（401）时账号标记为“登录已失效”，当前账号会自动换到下一个可用账号。少于 30 天到期时设置页提示重新登录。仍带 refresh token 的旧记录照常在到期前 30 分钟刷新。
+- 长效 token 不刷新：过期，或 Turn 因认证失败被 Claude 拒绝时，账号标记为“登录已失效”，当前账号会自动换到下一个可用账号（只有推理权限的 token 没有别的接口可复查，Turn 被拒即为结论；带 `user:profile` 的 token 先用额度接口复查，401 才算失效）。少于 30 天到期时设置页提示重新登录。仍带 refresh token 的旧记录照常在到期前 30 分钟刷新。
 
 ## 切换生效时机
 
@@ -64,8 +65,8 @@ codexhost 可以保存多个 Claude 订阅登录，让 Claude Code Thread 在其
 - `rate_limit_info.status` 为 `rejected` 表示 Claude 已拒绝请求：对应窗口记为 100%，并立即切换，不受阈值与 2 分钟冷却限制（按模型的周限额如 `seven_day_opus` 被拒同样切换）。被拒的那一轮以失败结束。
 - 撞限额自动续跑（`autoSwitch.continueAfterLimit`，默认开，旧配置视为开）：失败的那一轮在进行中收到过本进程的 `rejected`，且等这次额度记账和切换落定后当前账号已不是该轮所用账号时，Thread 用新账号 `resume` 同一会话，开一个自主 Turn，发送「继续」接着做（Thread 中显示为一条用户消息）。仍有后台命令等未结束工作时进程不能换，不续跑，下一条消息再换。两条用户消息之间最多续跑 3 次；关闭自动切换或续跑、没有可换的账号、普通失败（未收到 `rejected`）都不续跑。
 - 每个账号的 5 小时 / 7 天额度只推给在同一账号下运行的 Thread，不同账号的 Thread 不共享额度显示。
-- 当前账号登录失效（过期、被拒绝或刷新失败）时同样触发自动切换。Turn 因认证失败结束时，Adapter 立即复查该账号：确认被拒（401）即标记失效，下一条消息换到其他账号。
-- 额度每 60 秒内复用缓存，设置页“刷新额度”强制刷新；额度数据来自 `GET api.anthropic.com/api/oauth/usage`，不是实时推送。
+- 当前账号登录失效（过期、被拒绝或刷新失败）时同样触发自动切换。Turn 因认证失败结束时，Adapter 立即复查该账号（一年期 token 直接标记失效，带 `user:profile` 的用额度接口复查、401 才算），下一条消息换到其他账号。
+- 额度每 60 秒内复用缓存，设置页“刷新额度”强制刷新；有 `user:profile` 的账号从 `GET api.anthropic.com/api/oauth/usage` 读取，不是实时推送；一年期账号只有运行时 `rate_limit_event` 推送的数据。
 
 ## 日志
 
@@ -79,4 +80,4 @@ Renderer 经 `codexhost/harness/account-profiles`（`shared-contracts` 的 `harn
 
 - 单元测试：`packages/adapters/claude-code/test/account-profiles.test.ts`（一年期 token 请求与 scope、去重、切换、长效 token 不刷新、过期或被拒后自动换号、旧 refresh token 刷新、粘贴 setup-token、阈值切换、删除当前账号、文件存储、复制链接走授权码页、导入导出文件与 `.credentials.json`、本机登录只读且不刷新、本机账号切换改变会话键并可自动切到保存账号）、外部路由变量全部被挡住、旧账号额度不记到新账号、`rejected` 立即切换、Thread 状态统计、认证失败后换号）、`native-message.test.ts`（`rejected` 解析）与 `claude-code-adapter.test.ts` 的 “saved Claude sign-ins”（注入环境、空闲时按新账号 resume、运行中的 Turn 跑完再切、额度按进程所用账号上报、认证失败上报、被拒的一轮在新账号续跑、普通失败与未换号时不续跑）；`account-profiles.test.ts` 另覆盖续跑判定与日志不含邮箱或 token。
 - 2026-11-09 从 Claude Code 2.1.317 源码确认认证优先级（`ANTHROPIC_AUTH_TOKEN` > `CLAUDE_CODE_OAUTH_TOKEN` > 存储登录）、`CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST` 忽略设置文件中的供应商变量与 `apiKeyHelper`，以及 `rate_limit_info.status` 的 `rejected`。
-- 2026-11-09 在 Claude Code 2.1.317 上确认 `CLAUDE_CODE_OAUTH_TOKEN` 优先于钥匙串登录，并从其 `setup-token` 实现确认 scope 与 `expires_in` 参数。`user:inference user:profile` 可获一年期 token 的结论来自第三方实测（2026-09），本项目尚未用真实账号验证；Windows 实机尚未验证。
+- 2026-11-09 在 Claude Code 2.1.317 上确认 `CLAUDE_CODE_OAUTH_TOKEN` 优先于钥匙串登录。2026-11-10 真实账号用 `user:inference user:profile` 登录后到期日只有约 30 天（普通可刷新登录），第三方“这两个 scope 也给一年期”的结论不成立；随后从 Claude Code 2.1.321 的 `setup-token` 实现确认只申请 `user:inference`，且只在有 `user:profile` 时查额度。只申请 `user:inference` 后的真实账号登录尚待验证（Host 日志 `login.completed` 的 `lifetimeSeconds` 约 31536000、`refreshable: false` 即为成功）；Windows 实机尚未验证。

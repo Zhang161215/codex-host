@@ -17,6 +17,7 @@ import { ClaudeLoginFlow, type ClaudeLoginResult } from "./login.js";
 import { readClaudeNativeCredentials, readClaudeNativeIdentity } from "./native.js";
 import {
   ClaudeOAuthError,
+  claudeTokenReadsProfile,
   fetchClaudeProfile,
   fetchClaudeUsage,
   parseClaudeAccessToken,
@@ -507,6 +508,9 @@ export class ClaudeAccountProfiles implements HarnessAccountProfilesCapability {
       let failure: string | undefined;
       try {
         let tokens = await this.#tokensFor(profileId);
+        // Without the profile scope there is no usage to read; quota arrives from the native
+        // sessions that run under the sign-in.
+        if (!claudeTokenReadsProfile(tokens)) return;
         try {
           usage = await fetchClaudeUsage(this.#fetch, tokens.accessToken);
         } catch (error) {
@@ -620,7 +624,20 @@ export class ClaudeAccountProfiles implements HarnessAccountProfilesCapability {
    */
   reportAuthenticationFailure(profileId: string): void {
     this.#log("turn.authenticationFailed", { profileId });
-    void this.#refreshProfileUsage(profileId, true).catch(() => undefined);
+    void this.#recheckSignIn(profileId).catch(() => undefined);
+  }
+
+  /** Asks Claude whether a sign-in it refused during a Turn is still valid. */
+  async #recheckSignIn(profileId: string): Promise<void> {
+    const tokens = await this.#tokens.read(profileId);
+    if (tokens && !claudeTokenReadsProfile(tokens)) {
+      // Nothing else this token can read would answer differently: a refreshable one is renewed
+      // (a revoked refresh marks it expired), and a one-year one stands refused.
+      if (tokens.refreshToken) await this.#tokensFor(profileId, true);
+      else await this.#markExpired(profileId, "Sign-in expired or was revoked");
+      return;
+    }
+    await this.#refreshProfileUsage(profileId, true);
   }
 
   /**

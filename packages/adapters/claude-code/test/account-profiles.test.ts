@@ -52,8 +52,14 @@ function fakeAnthropic(accounts: Record<string, FakeAccount>) {
   const byRefresh = new Map<string, FakeAccount>();
   const inferenceOnly = new Set<string>();
   const exchanges: Array<Record<string, unknown>> = [];
+  /** The scope each sign-in's authorize link asked for, by authorization code. */
+  const authorized = new Map<string, string>();
   let issued = 0;
-  const issue = (account: FakeAccount, lifetime?: number) => {
+  const issue = (
+    account: FakeAccount,
+    lifetime?: number,
+    scope = "user:inference user:profile",
+  ) => {
     issued += 1;
     const access = `access-${account.uuid}-${issued}`;
     byAccess.set(access, account);
@@ -62,12 +68,8 @@ function fakeAnthropic(accounts: Record<string, FakeAccount>) {
       organization: { uuid: `org-${account.uuid}`, name: "Personal" },
     };
     if (lifetime !== undefined) {
-      return {
-        access_token: access,
-        expires_in: lifetime,
-        scope: "user:inference user:profile",
-        ...identity,
-      };
+      if (!scope.split(" ").includes("user:profile")) inferenceOnly.add(access);
+      return { access_token: access, expires_in: lifetime, scope, ...identity };
     }
     const refresh = `refresh-${account.uuid}-${issued}`;
     byRefresh.set(refresh, account);
@@ -75,7 +77,8 @@ function fakeAnthropic(accounts: Record<string, FakeAccount>) {
       access_token: access,
       refresh_token: refresh,
       expires_in: 28_800,
-      scope: "user:inference user:profile",
+      refresh_token_expires_in: 2_592_000,
+      scope,
       ...identity,
     };
   };
@@ -89,9 +92,14 @@ function fakeAnthropic(accounts: Record<string, FakeAccount>) {
         exchanges.push(body);
         const account = accounts[String(body.code)];
         if (!account) return json({ error: "invalid_grant" }, 400);
-        return json(
-          issue(account, typeof body.expires_in === "number" ? body.expires_in : undefined),
-        );
+        // As Claude's token endpoint does: a custom lifetime only for an inference-only sign-in;
+        // asking for more gets an ordinary refreshable login.
+        const scope = authorized.get(String(body.code)) ?? "user:inference user:profile";
+        const lifetime =
+          typeof body.expires_in === "number" && scope === "user:inference"
+            ? body.expires_in
+            : undefined;
+        return json(issue(account, lifetime, scope));
       }
       const refreshToken = String(body.refresh_token);
       const account = byRefresh.get(refreshToken);
@@ -117,6 +125,7 @@ function fakeAnthropic(accounts: Record<string, FakeAccount>) {
   return {
     fetch,
     exchanges,
+    authorize: (code: string, scope: string) => authorized.set(code, scope),
     revoke: (uuid: string) => revoked.add(uuid),
     /** A token as `claude setup-token` prints it: inference only, lifetime unknown to us. */
     setupToken(account: FakeAccount): string {
@@ -158,7 +167,9 @@ async function setup(accounts: Record<string, FakeAccount>, now = () => Date.now
   const signIn = async (code: string) => {
     const started = await profiles.handle({ action: "login.start", mode: "manual" });
     const login = defined(started.login);
-    const state = new URL(login.authorizeUrl).searchParams.get("state");
+    const link = new URL(login.authorizeUrl);
+    anthropic.authorize(code, link.searchParams.get("scope") ?? "");
+    const state = link.searchParams.get("state");
     return profiles.handle({
       action: "login.complete",
       loginId: login.loginId,
@@ -241,22 +252,28 @@ describe("Claude account profiles", () => {
   it("saves a sign-in, makes the first one active and injects its token", async () => {
     const { profiles, anthropic, signIn } = await setup({ "code-a": alice, "code-b": bob });
     const first = await signIn("code-a");
-    // A one-year token, as `claude setup-token` requests, with the scopes that allow it.
+    // A one-year token as `claude setup-token` gets it: inference scope only. Asking for
+    // `user:profile` too would get a refreshable login that ends after about 30 days.
     expect(anthropic.exchanges[0]).toMatchObject({ expires_in: 31_536_000 });
     const scope = new URL(defined(first.login).authorizeUrl).searchParams.get("scope");
-    expect(scope).toBe("user:inference user:profile");
+    expect(scope).toBe("user:inference");
     const yearAhead = Date.now() + 364 * 86_400_000;
     expect(Date.parse(defined(first.profiles[0]?.expiresAt))).toBeGreaterThan(yearAhead);
     expect(first.login?.status).toBe("completed");
     expect(first.activeProfileId).toBe(first.profiles[0]?.profileId);
     expect(first.profiles[0]).toMatchObject({
       label: "alice@example.com",
-      plan: "max",
       active: true,
       status: "ready",
-      fiveHour: { usedPercent: 20 },
-      sevenDay: { usedPercent: 30 },
     });
+    // Without the profile scope neither the profile nor usage is asked for; quota arrives from
+    // the sessions that run under the account.
+    expect(anthropic.fetch.mock.calls.some(([url]) => url.includes("/api/oauth/"))).toBe(false);
+    expect(first.profiles[0]?.fiveHour).toBeUndefined();
+    profiles.observePlanLimit({ fiveHour: { utilizationPercent: 20 } });
+    await vi.waitFor(async () =>
+      expect((await profiles.state()).profiles[0]?.fiveHour).toMatchObject({ usedPercent: 20 }),
+    );
     const second = await signIn("code-b");
     expect(second.profiles).toHaveLength(2);
     expect(second.activeProfileId).toBe(first.activeProfileId);
@@ -340,18 +357,29 @@ describe("Claude account profiles", () => {
     expect(state.lastSwitch).toMatchObject({ fromProfileId: aliceId, reason: "auto" });
   });
 
-  it("a long-lived token Claude rejects is marked expired and the next account takes over", async () => {
+  it("a one-year token Claude rejects in a Turn is marked expired and the next account takes over", async () => {
     const { profiles, anthropic, signIn } = await setup({ "code-a": alice, "code-b": bob });
     await signIn("code-a");
     await signIn("code-b");
     const aliceId = defined((await profiles.state()).activeProfileId);
     anthropic.revoke("alice");
+    // Refreshing usage cannot ask about a token without the profile scope, so it stays usable.
     await profiles.handle({ action: "list", refreshUsage: true });
+    expect((await profiles.state()).profiles.find((p) => p.profileId === aliceId)?.status).toBe(
+      "ready",
+    );
+    profiles.reportAuthenticationFailure(aliceId);
+    await vi.waitFor(async () =>
+      expect((await profiles.state()).profiles.find((p) => p.profileId === aliceId)?.status).toBe(
+        "expired",
+      ),
+    );
     const spawn = await profiles.spawnEnvironment();
     expect(defined(spawn).apply({}).CLAUDE_CODE_OAUTH_TOKEN).toMatch(/^access-bob-/u);
-    const state = await profiles.state();
-    expect(state.profiles.find((item) => item.profileId === aliceId)?.status).toBe("expired");
-    expect(state.lastSwitch).toMatchObject({ fromProfileId: aliceId, reason: "auto" });
+    expect((await profiles.state()).lastSwitch).toMatchObject({
+      fromProfileId: aliceId,
+      reason: "auto",
+    });
   });
 
   it("switches automatically at the threshold to the account with most quota left", async () => {
@@ -361,6 +389,10 @@ describe("Claude account profiles", () => {
     const state = await signIn("code-c");
     const aliceId = defined(state.activeProfileId);
     const bobId = defined(state.profiles.find((item) => item.email === bob.email)).profileId;
+    const carolId = defined(state.profiles.find((item) => item.email === carol.email)).profileId;
+    // Quota seen while each account last ran.
+    profiles.observePlanLimit({ fiveHour: { utilizationPercent: 99 } }, carolId);
+    profiles.observePlanLimit({ fiveHour: { utilizationPercent: 5 } }, bobId);
     profiles.observePlanLimit({ fiveHour: { utilizationPercent: 90 } });
     await vi.waitFor(async () =>
       expect(
@@ -399,7 +431,7 @@ describe("Claude account profiles", () => {
       CLAUDE_CODE_OAUTH_TOKEN: expect.stringMatching(/^access-alice-/u),
       // Claude Code then ignores provider and credential settings from settings files too.
       CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST: "1",
-      CLAUDE_CODE_SUBSCRIPTION_TYPE: "max",
+      // The inherited plan is another account's; this one's is unknown without its profile.
       CLAUDE_CODE_ORGANIZATION_UUID: "org-alice",
     });
   });
@@ -411,6 +443,7 @@ describe("Claude account profiles", () => {
     const aliceId = defined(state.activeProfileId);
     const bobId = defined(state.profiles.find((item) => item.email === bob.email)).profileId;
     await profiles.handle({ action: "activate", profileId: bobId });
+    profiles.observePlanLimit({ fiveHour: { utilizationPercent: 5 } }, bobId);
     profiles.observePlanLimit({ fiveHour: { utilizationPercent: 100 }, rejected: true }, aliceId);
     await vi.waitFor(async () =>
       expect(

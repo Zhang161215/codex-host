@@ -2,11 +2,11 @@ import { createHash, randomBytes } from "node:crypto";
 
 /**
  * Claude.ai subscription OAuth, as Claude Code performs it for `claude setup-token` (verified
- * against Claude Code 2.1.317): the token exchange asks for a one-year access token, so a saved
- * sign-in needs no refresh. The token endpoint only honours a custom `expires_in` for some scopes
- * (`user:mcp_servers`, for one, is rejected), hence the reduced scope set. `user:profile` keeps the
- * profile and usage endpoints available; Claude Code itself treats a token passed through
- * `CLAUDE_CODE_OAUTH_TOKEN` as inference-only either way.
+ * against Claude Code 2.1.321): inference scope only, and the token exchange asks for a one-year
+ * access token, so a saved sign-in needs no refresh. Asking for `user:profile` as well gets an
+ * ordinary refreshable login instead, whose refresh token ends after about 30 days. Without
+ * `user:profile` the profile and usage endpoints are unavailable, as they are to Claude Code's own
+ * setup tokens; quota then arrives from the native sessions that run under the sign-in.
  */
 export const CLAUDE_OAUTH = Object.freeze({
   clientId: "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
@@ -14,7 +14,7 @@ export const CLAUDE_OAUTH = Object.freeze({
   tokenUrl: "https://platform.claude.com/v1/oauth/token",
   manualRedirectUrl: "https://platform.claude.com/oauth/code/callback",
   apiBaseUrl: "https://api.anthropic.com",
-  scopes: ["user:inference", "user:profile"],
+  scopes: ["user:inference"],
   /** One year, the lifetime `claude setup-token` requests. */
   tokenLifetimeSeconds: 31_536_000,
 });
@@ -188,6 +188,14 @@ function parseTokens(value: unknown, previous?: ClaudeOAuthTokens): ClaudeOAuthT
   };
 }
 
+/**
+ * Whether a token may read the profile and usage endpoints, which need `user:profile` (Claude Code
+ * makes the same check). A token whose scopes are unknown, such as a pasted one, is tried.
+ */
+export function claudeTokenReadsProfile(tokens: Pick<ClaudeOAuthTokens, "scopes">): boolean {
+  return tokens.scopes.length === 0 || tokens.scopes.includes("user:profile");
+}
+
 function identityFrom(value: unknown): ClaudeOAuthProfile {
   const account = isRecord(value) && isRecord(value.account) ? value.account : {};
   const organization = isRecord(value) && isRecord(value.organization) ? value.organization : {};
@@ -197,6 +205,8 @@ function identityFrom(value: unknown): ClaudeOAuthProfile {
     ["email", text(account.email_address) ?? text(account.email)],
     ["organizationUuid", text(organization.uuid)],
     ["organizationName", text(organization.name)],
+    // The token response may name the plan; an inference-only sign-in has no profile to ask.
+    ["plan", planFrom(account, organization)],
   ];
   for (const [key, field] of fields) if (field) identity[key] = field;
   return identity;
@@ -233,7 +243,12 @@ export async function exchangeClaudeCode(
     },
     "Sign-in",
   );
-  return { tokens: parseTokens(value), identity: identityFrom(value) };
+  const tokens = parseTokens(value);
+  return {
+    // A response that omits `scope` granted what was asked for.
+    tokens: tokens.scopes.length ? tokens : { ...tokens, scopes: [...CLAUDE_OAUTH.scopes] },
+    identity: identityFrom(value),
+  };
 }
 
 export async function refreshClaudeTokens(

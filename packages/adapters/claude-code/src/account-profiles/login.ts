@@ -7,6 +7,7 @@ import type { HarnessAccountLogin } from "@codexhost/shared-contracts";
 import { writeClaudeAccountLog, type ClaudeAccountLog } from "./log.js";
 import {
   claudeAuthorizeUrl,
+  claudeTokenReadsProfile,
   createClaudePkce,
   exchangeClaudeCode,
   fetchClaudeProfile,
@@ -213,13 +214,17 @@ export class ClaudeLoginFlow {
           pkce: login.pkce,
           port,
         });
-        // The profile adds the plan; the identity from the token response is enough without it.
-        const profile = await fetchClaudeProfile(this.fetchImpl, tokens.accessToken).catch(
-          (error: unknown) => {
-            this.log("login.profileUnavailable", { loginId: login.loginId, error: text(error) });
-            return {};
-          },
-        );
+        // The profile adds the plan; the identity from the token response is enough without it,
+        // and a one-year sign-in has no profile scope to read it with.
+        const profile = claudeTokenReadsProfile(tokens)
+          ? await fetchClaudeProfile(this.fetchImpl, tokens.accessToken).catch((error: unknown) => {
+              this.log("login.profileUnavailable", {
+                loginId: login.loginId,
+                error: text(error),
+              });
+              return {};
+            })
+          : {};
         login.profileId = await this.save({ tokens, profile: { ...identity, ...profile } });
         login.status = "completed";
         this.log("login.completed", {
